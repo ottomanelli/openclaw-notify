@@ -1,0 +1,67 @@
+{
+  "name": "@openclaw/notify",
+  "version": "0.1.0",
+  "private": false,
+  "description": "OpenClaw plugin: shared notifications queue with batched LLM-formatted delivery and multi-destination routing",
+  "license": "MIT-0",
+  "author": "Francis Ottomanelli",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "notifications",
+    "queue",
+    "llm",
+    "telegram",
+    "slack",
+    "discord",
+    "signal",
+    "imessage"
+  ],
+  "homepage": "https://github.com/ottomanelli/openclaw-notify#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ottomanelli/openclaw-notify.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ottomanelli/openclaw-notify/issues"
+  },
+  "type": "module",
+  "main": "index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./openclaw.plugin.json": "./openclaw.plugin.json"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": ["index.ts", "src/", "openclaw.plugin.json", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "compat": {
+      "pluginApi": ">=2026.3.24-beta.2",
+      "minGatewayVersion": "2026.3.24-beta.2"
+    },
+    "build": {
+      "openclawVersion": "2026.4.15",
+      "pluginSdkVersion": "2026.4.15"
+    }
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.24-beta.2"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.0.0",
+    "commander": "^12.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "id": "notify",
+  "name": "Notify",
+  "description": "Shared notifications queue with batched LLM-formatted delivery and multi-destination routing.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "tickIntervalSec": {
+        "type": "number",
+        "minimum": 10,
+        "default": 1800
+      },
+      "destinations": {
+        "type": "object",
+        "required": ["default"],
+        "properties": {
+          "default": { "$ref": "#/$defs/destination" }
+        },
+        "additionalProperties": { "$ref": "#/$defs/destination" }
+      },
+      "quietHours": {
+        "type": ["object", "null"],
+        "additionalProperties": false,
+        "required": ["start", "end", "tz"],
+        "properties": {
+          "start": { "type": "string", "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$" },
+          "end": { "type": "string", "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$" },
+          "tz": { "type": "string" }
+        }
+      },
+      "llm": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "provider": {
+            "type": ["string", "null"],
+            "enum": ["anthropic", "openai", "google", "groq", "ollama", null],
+            "default": null
+          },
+          "model": { "type": ["string", "null"], "default": null }
+        }
+      },
+      "personality": { "type": ["string", "null"], "maxLength": 2048, "default": null },
+      "dedupWindowMin": { "type": "number", "minimum": 0, "default": 15 }
+    },
+    "$defs": {
+      "destination": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["channel", "chatId"],
+        "properties": {
+          "channel": {
+            "type": "string",
+            "enum": ["telegram", "discord", "slack", "signal", "imessage"]
+          },
+          "chatId": { "type": "string" },
+          "threadId": { "type": ["string", "number", "null"] }
+        }
+      }
+    }
+  }
+}

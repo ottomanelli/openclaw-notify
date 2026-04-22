@@ -86,6 +86,7 @@ const notifyPlugin: OpenClawPluginDefinition = {
           dbPath,
           config,
           tickFn,
+          runtime,
         });
       },
       { commands: ["notify"] },

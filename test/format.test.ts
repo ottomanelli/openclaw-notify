@@ -353,9 +353,8 @@ describe("formatBatch", () => {
         resolveApiKeyForProvider: vi.fn(async () => ({ apiKey: "k", source: "t", mode: "api-key" })),
       },
     };
-    // The LLM call fails so the logger warn path runs; also verify the fetchFn
-    // received a body shaped for anthropic so we know the request actually
-    // went to the network. The test above covers the template fallback branch.
+    // Captures the request body so we can assert the channel hint landed in
+    // the system prompt sent over the wire.
     const capturedBodies: unknown[] = [];
     const fetchFn = vi.fn(async (_url: string, opts: RequestInit) => {
       capturedBodies.push(JSON.parse(opts.body as string));
@@ -374,25 +373,78 @@ describe("formatBatch", () => {
     expect(body.system).toContain("**bold**");
   });
 
-  it("calls logger.warn when the LLM throws and falls back to the template", async () => {
+  it("logs error-level (not warn) when the LLM throws and falls back to the template", async () => {
     const rt = {
       modelAuth: {
         resolveApiKeyForProvider: vi.fn(async () => ({ apiKey: "k", source: "t", mode: "api-key" })),
       },
     };
     const fetchFn = vi.fn(async () => { throw new Error("boom"); });
+    const error = vi.fn();
     const warn = vi.fn();
     const rows = [row({ source: "todo", raw_data: JSON.stringify({ text: "Buy beans" }) })];
     const out = await formatBatch(
       rt as never,
       rows,
-      { enabled: true, provider: "anthropic", model: null },
+      // Unique provider/model keeps this test independent of others that also
+      // trigger the fallback — the throttle map is module-level.
+      { enabled: true, provider: "anthropic", model: `model-error-${Date.now()}` },
       null,
-      { fetchFn: fetchFn as never, logger: { warn } },
+      { fetchFn: fetchFn as never, logger: { error, warn } },
     );
     expect(out).toBe("*todo* — Buy beans");
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0][0]).toMatch(/LLM call failed/);
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error.mock.calls[0][0]).toMatch(/notifications are falling back to plain templates/);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("throttles repeat fallback errors for the same provider/model within the window", async () => {
+    const rt = {
+      modelAuth: {
+        resolveApiKeyForProvider: vi.fn(async () => ({ apiKey: "k", source: "t", mode: "api-key" })),
+      },
+    };
+    const fetchFn = vi.fn(async () => { throw new Error("still down"); });
+    const error = vi.fn();
+    const debug = vi.fn();
+    const rows = [row({ source: "todo", raw_data: JSON.stringify({ text: "hi" }) })];
+    const model = `model-throttle-${Date.now()}`;
+    for (let i = 0; i < 3; i++) {
+      await formatBatch(
+        rt as never,
+        rows,
+        { enabled: true, provider: "anthropic", model },
+        null,
+        { fetchFn: fetchFn as never, logger: { error, debug } },
+      );
+    }
+    expect(error).toHaveBeenCalledTimes(1);
+    // Subsequent failures go to debug so they don't disappear entirely for
+    // someone actively tailing logs, but don't spam the error channel.
+    // (The generic "formatting via …" debug line also fires every batch, so
+    // filter by substring to isolate throttled-fallback lines.)
+    const throttledDebugCalls = debug.mock.calls.filter(([m]) =>
+      typeof m === "string" && /still failing \(throttled\)/.test(m),
+    );
+    expect(throttledDebugCalls).toHaveLength(2);
+  });
+
+  it("falls back without logging error if no logger was provided", async () => {
+    const rt = {
+      modelAuth: {
+        resolveApiKeyForProvider: vi.fn(async () => ({ apiKey: "k", source: "t", mode: "api-key" })),
+      },
+    };
+    const fetchFn = vi.fn(async () => { throw new Error("boom"); });
+    const rows = [row({ source: "todo", raw_data: JSON.stringify({ text: "hi" }) })];
+    const out = await formatBatch(
+      rt as never,
+      rows,
+      { enabled: true, provider: "anthropic", model: `model-nolog-${Date.now()}` },
+      null,
+      { fetchFn: fetchFn as never },
+    );
+    expect(out).toBe("*todo* — hi");
   });
 
 });

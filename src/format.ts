@@ -54,7 +54,38 @@ const PROVIDER_PRIORITY = VALID_LLM_PROVIDERS;
 export type FormatLogger = {
   debug?(m: string): void;
   warn?(m: string): void;
+  error?(m: string): void;
 };
+
+// LLM fallback is the main signal that a model was deprecated, an API key
+// lapsed, or a provider is having an outage — any of which silently degrades
+// notifications to the terse template path. Log at error-level so the
+// operator actually sees it, but throttle per (provider, model) to avoid
+// pinning the log with one line per batch during a sustained outage.
+const LLM_FALLBACK_LOG_THROTTLE_MS = 60 * 60_000;
+const lastLlmFallbackLogAt = new Map<string, number>();
+
+function logLlmFallback(
+  logger: FormatLogger | null,
+  provider: string,
+  model: string,
+  errMsg: string,
+): void {
+  const key = `${provider}/${model}`;
+  const now = Date.now();
+  const last = lastLlmFallbackLogAt.get(key) ?? 0;
+  if (now - last >= LLM_FALLBACK_LOG_THROTTLE_MS) {
+    lastLlmFallbackLogAt.set(key, now);
+    const emit = logger?.error ?? logger?.warn;
+    emit?.(
+      `notify: LLM ${key} failing — notifications are falling back to plain templates. ` +
+        `Check your API key, pin a current llm.model, or set llm.enabled=false. ` +
+        `Error: ${errMsg}`,
+    );
+  } else {
+    logger?.debug?.(`notify: LLM ${key} still failing (throttled): ${errMsg}`);
+  }
+}
 
 export type ResolvedLlm = {
   provider: string;
@@ -301,9 +332,8 @@ export async function formatBatch(
   try {
     return await callLlm(resolved, systemPrompt, userPrompt, fetchFn);
   } catch (err) {
-    logger?.warn?.(
-      `notify: LLM call failed (${resolved.provider}/${resolved.model}), falling back to template: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logLlmFallback(logger, resolved.provider, resolved.model, errMsg);
     return renderTemplate(rows, channel);
   }
 }

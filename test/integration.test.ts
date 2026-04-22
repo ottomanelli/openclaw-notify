@@ -71,6 +71,7 @@ describe("integration: enqueue via CLI → tick → deliver", () => {
         const db = openDb(dbPath);
         try { await tick(db, config, runtime as never, logger, opts); } finally { closeDb(db); }
       },
+      runtime: runtime as never,
     });
 
     const origLog = console.log;

@@ -1,7 +1,7 @@
 import type { NotifyConfig, ChannelName, RuntimeBridge } from "./types.js";
 import type { TickLogger } from "./tick.js";
 
-const SEND_FN_BY_CHANNEL: Record<ChannelName, string> = {
+export const SEND_FN_BY_CHANNEL: Record<ChannelName, string> = {
   telegram: "sendMessageTelegram",
   discord:  "sendMessageDiscord",
   slack:    "sendMessageSlack",

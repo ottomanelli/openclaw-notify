@@ -1,7 +1,9 @@
 import type { Command } from "commander";
-import type { NotifyConfig } from "./types.js";
+import type { NotifyConfig, RuntimeBridge } from "./types.js";
 import { openDb, closeDb } from "./db.js";
 import { enqueue, purge } from "./queue.js";
+import { callLlm, selectProviderAndModel } from "./format.js";
+import { SEND_FN_BY_CHANNEL } from "./validate.js";
 
 // Caps exist so a rogue consumer can't fill the index with megabyte keys.
 const MAX_SOURCE_LEN = 64;
@@ -23,6 +25,7 @@ export type CliDeps = {
   dbPath: string;
   config: NotifyConfig;
   tickFn: (opts: { force: boolean; onlyDestination?: string }) => Promise<void>;
+  runtime: RuntimeBridge;
 };
 
 export function registerNotifyCli(deps: CliDeps): void {
@@ -133,6 +136,108 @@ export function registerNotifyCli(deps: CliDeps): void {
         closeDb(db);
       }
     });
+
+  notify
+    .command("doctor")
+    .description("Probe config, destinations, LLM provider, and queue health")
+    .option("--skip-llm", "Skip the live LLM probe (no API call)", false)
+    .action(async (opts: { skipLlm?: boolean }) => {
+      const report = await runDoctor({
+        dbPath,
+        config: deps.config,
+        runtime: deps.runtime,
+        skipLlm: !!opts.skipLlm,
+      });
+      for (const line of report.lines) console.log(line);
+      // Non-zero exit when something is unhealthy so `notify doctor` composes
+      // with shell scripts, CI, and systemd `ExecStartPre=`.
+      if (!report.ok) process.exitCode = 1;
+    });
+}
+
+type DoctorReport = { ok: boolean; lines: string[] };
+
+// Extracted so tests can call it without going through commander and stdout.
+export async function runDoctor(params: {
+  dbPath: string;
+  config: NotifyConfig;
+  runtime: RuntimeBridge;
+  skipLlm: boolean;
+  fetchFn?: typeof fetch;
+}): Promise<DoctorReport> {
+  const { dbPath, config, runtime, skipLlm, fetchFn = fetch } = params;
+  const lines: string[] = [];
+  let ok = true;
+
+  // Config was already parsed by the plugin entrypoint — if we got here, it's valid.
+  lines.push("✓ config: valid");
+
+  for (const [name, dest] of Object.entries(config.destinations)) {
+    const fnName = SEND_FN_BY_CHANNEL[dest.channel];
+    const ns = (runtime.channel as Record<string, unknown>)[dest.channel] as
+      | Record<string, unknown>
+      | undefined;
+    if (ns && typeof ns[fnName] === "function") {
+      lines.push(`✓ destination "${name}": ${dest.channel} channel registered`);
+    } else {
+      lines.push(`✗ destination "${name}": ${dest.channel} channel NOT registered`);
+      ok = false;
+    }
+  }
+
+  if (!config.llm.enabled) {
+    lines.push("- llm: disabled (template fallback only)");
+  } else if (skipLlm) {
+    lines.push("- llm: probe skipped (--skip-llm)");
+  } else {
+    const resolved = await selectProviderAndModel(runtime, config.llm);
+    if (!resolved) {
+      lines.push("✗ llm: no provider has an API key — batches will use template fallback");
+      ok = false;
+    } else {
+      // Tiny throwaway prompt: < 10 tokens each way, effectively free on
+      // every metered provider but still exercises the real URL, auth,
+      // and response-parsing path.
+      try {
+        const started = Date.now();
+        const out = await callLlm(resolved, "Respond with a single word.", "ping", fetchFn);
+        const ms = Date.now() - started;
+        const snippet = out.trim().replace(/\s+/g, " ").slice(0, 40);
+        lines.push(`✓ llm: ${resolved.provider}/${resolved.model} — responded in ${ms}ms ("${snippet}")`);
+      } catch (err) {
+        lines.push(
+          `✗ llm: ${resolved.provider}/${resolved.model} — ${err instanceof Error ? err.message : String(err)}`,
+        );
+        ok = false;
+      }
+    }
+  }
+
+  const db = openDb(dbPath);
+  try {
+    const pending = db
+      .prepare(
+        "SELECT COUNT(*) AS c, MIN(created_at) AS oldest FROM notifications WHERE sent_at IS NULL AND failed_at IS NULL",
+      )
+      .get() as { c: number; oldest: number | null };
+    const failed = db
+      .prepare("SELECT COUNT(*) AS c FROM notifications WHERE failed_at IS NOT NULL")
+      .get() as { c: number };
+    let queueLine = `queue: ${pending.c} pending, ${failed.c} failed`;
+    if (pending.oldest != null) {
+      const ageMin = Math.round((Date.now() - pending.oldest) / 60_000);
+      queueLine += `, oldest pending ${ageMin}m old`;
+    }
+    // Warn (not fail) if failed rows exist — the queue is still operational,
+    // but the operator should know they're accumulating.
+    const marker = failed.c > 0 ? "•" : "✓";
+    lines.push(`${marker} ${queueLine}`);
+    if (failed.c > 0) lines.push(`  → run "openclaw notify list --failed" to inspect`);
+  } finally {
+    closeDb(db);
+  }
+
+  return { ok, lines };
 }
 
 function parseDurationToDays(input: string): number {

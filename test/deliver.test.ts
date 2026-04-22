@@ -96,4 +96,69 @@ describe("deliver", () => {
     expect(sentText.length).toBe(1990);
     expect(sentText.endsWith("…")).toBe(true);
   });
+
+  it("retries telegram as plain text when the first send fails with a markdown parse error", async () => {
+    const calls: Array<{ text: string; opts: { textMode?: string } }> = [];
+    const sendMessageTelegram = vi.fn(async (_to: string, text: string, opts: { textMode?: string }) => {
+      calls.push({ text, opts });
+      if (opts.textMode === "markdown") {
+        throw new Error("Bad Request: can't parse entities: Character '_' is reserved");
+      }
+      return { messageId: "m-plain" };
+    }) as never;
+    const { runtime } = fakeRuntime({ sendMessageTelegram });
+    const dest: Destination = { channel: "telegram", chatId: "123", threadId: null };
+    const result = await deliver(runtime as never, dest, "oops *foo_bar");
+    expect(result).toEqual({ ok: true, messageId: "m-plain" });
+    expect(calls).toHaveLength(2);
+    expect(calls[0].opts.textMode).toBe("markdown");
+    expect(calls[1].opts.textMode).toBe("plain");
+  });
+
+  it("retries signal as plain text when the first send fails with a markdown-looking error", async () => {
+    const sendMessageSignal = vi.fn(async (_to: string, _text: string, opts: { textMode?: string }) => {
+      if (opts.textMode === "markdown") throw new Error("markdown rendering failed");
+      return { messageId: "m-plain" };
+    }) as never;
+    const runtime = { channel: { signal: { sendMessageSignal } } };
+    const dest: Destination = { channel: "signal", chatId: "+15551234567", threadId: null };
+    const result = await deliver(runtime as never, dest, "hi");
+    expect(result).toEqual({ ok: true, messageId: "m-plain" });
+    expect(sendMessageSignal).toHaveBeenCalledTimes(2);
+  });
+
+  it("does NOT retry non-markdown errors on telegram", async () => {
+    const sendMessageTelegram = vi.fn(async () => {
+      throw new Error("ETIMEDOUT");
+    }) as never;
+    const { runtime } = fakeRuntime({ sendMessageTelegram });
+    const dest: Destination = { channel: "telegram", chatId: "123", threadId: null };
+    const result = await deliver(runtime as never, dest, "hi");
+    expect(result.ok).toBe(false);
+    expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT plain-text-retry on discord (channel has no textMode)", async () => {
+    const sendMessageDiscord = vi.fn(async () => {
+      throw new Error("Bad Request: markdown parse failed");
+    }) as never;
+    const { runtime } = fakeRuntime({ sendMessageDiscord });
+    const dest: Destination = { channel: "discord", chatId: "c1", threadId: null };
+    const result = await deliver(runtime as never, dest, "hi");
+    expect(result.ok).toBe(false);
+    expect(sendMessageDiscord).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the plain-text attempt's error if the retry also fails", async () => {
+    const sendMessageTelegram = vi.fn(async (_to: string, _text: string, opts: { textMode?: string }) => {
+      if (opts.textMode === "markdown") throw new Error("can't parse entities");
+      throw new Error("downstream unavailable");
+    }) as never;
+    const { runtime } = fakeRuntime({ sendMessageTelegram });
+    const dest: Destination = { channel: "telegram", chatId: "123", threadId: null };
+    const result = await deliver(runtime as never, dest, "hi");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toBe("downstream unavailable");
+    expect(sendMessageTelegram).toHaveBeenCalledTimes(2);
+  });
 });

@@ -27,17 +27,37 @@ function capMessage(channel: ChannelName, message: string): string {
   return message.slice(0, max - 1) + "…";
 }
 
+// Heuristic for "channel rejected our markdown." Telegram returns messages
+// like "Bad Request: can't parse entities: Character '_' is reserved…";
+// signal bridges emit varied errors but usually include "parse" or "markdown".
+// False positives are cheap (one extra plain-text retry); false negatives mean
+// a recoverable message gets retried 5× and then discarded, so lean liberal.
+const MARKDOWN_ERROR_RE = /parse|entit|markdown|mrkdwn|textmode/i;
+
+function looksLikeMarkdownError(err: string): boolean {
+  return MARKDOWN_ERROR_RE.test(err);
+}
+
+// Only these channels accept a textMode flag. Discord, slack, and imessage
+// either render their own markdown silently (no parse error) or ignore it,
+// so the plain-text retry would be pointless there.
+function channelAcceptsPlainMode(channel: ChannelName): boolean {
+  return channel === "telegram" || channel === "signal";
+}
+
 async function sendOne(
   runtime: RuntimeBridge,
   dest: Destination,
   message: string,
+  plainText = false,
 ): Promise<{ messageId: string }> {
   const capped = capMessage(dest.channel, message);
+  const textMode: "markdown" | "plain" = plainText ? "plain" : "markdown";
   switch (dest.channel) {
     case "telegram": {
       const ns = runtime.channel.telegram;
       if (!ns?.sendMessageTelegram) throw new Error("telegram channel not registered");
-      const opts: TelegramSendOpts = { textMode: "markdown" };
+      const opts: TelegramSendOpts = { textMode };
       if (dest.threadId != null) opts.messageThreadId = Number(dest.threadId);
       return ns.sendMessageTelegram(dest.chatId, capped, opts);
     }
@@ -56,7 +76,7 @@ async function sendOne(
     case "signal": {
       const ns = runtime.channel.signal;
       if (!ns?.sendMessageSignal) throw new Error("signal channel not registered");
-      const opts: SignalSendOpts = { textMode: "markdown" };
+      const opts: SignalSendOpts = { textMode };
       return ns.sendMessageSignal(dest.chatId, capped, opts);
     }
     case "imessage": {
@@ -76,6 +96,15 @@ export async function deliver(
     const { messageId } = await sendOne(runtime, dest, message);
     return { ok: true, messageId };
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (channelAcceptsPlainMode(dest.channel) && looksLikeMarkdownError(errMsg)) {
+      try {
+        const { messageId } = await sendOne(runtime, dest, message, true);
+        return { ok: true, messageId };
+      } catch (err2) {
+        return { ok: false, error: err2 instanceof Error ? err2.message : String(err2) };
+      }
+    }
+    return { ok: false, error: errMsg };
   }
 }

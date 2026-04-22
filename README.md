@@ -61,7 +61,11 @@ openclaw notify list              # print pending rows as JSON
 openclaw notify list --failed     # only rows that exceeded the retry budget
 openclaw notify list --all        # include sent and failed rows
 openclaw notify purge --older-than 30d
+openclaw notify doctor            # probe config, destinations, LLM, and queue
+openclaw notify doctor --skip-llm # skip the live LLM API probe
 ```
+
+`notify doctor` exits non-zero when anything is unhealthy (a destination channel isn't registered, the configured LLM provider has no key, the live LLM probe fails, etc.), so it composes cleanly with shell scripts, CI checks, and systemd `ExecStartPre=`.
 
 ## How it works
 
@@ -81,9 +85,12 @@ Each batch generates a fresh random 8-hex nonce. Every piece of consumer text is
 
 ## Reliability
 
+Delivery is **at-least-once**. Duplicates are rare but possible (see the duplicate window below); for notification workloads that's an acceptable trade. If you need exactly-once, dedupe on the receiver side by `(source, category, time-bucket)`.
+
 - **Crash recovery.** Rows are atomically claimed via `UPDATE ... RETURNING` before delivery. If a tick process crashes between claim and `sent_at` being stamped, the reservation times out after 10 minutes and the row becomes eligible again.
-- **Retry.** On delivery failure the reservation is released immediately; the next tick picks the row up.
-- **No double-send.** A single `UPDATE ... RETURNING` guarantees that if two processes both try to claim the same row, only one sees it in the result set.
+- **Retry.** On delivery failure the reservation is released immediately; the next tick picks the row up. Markdown parse errors on Telegram/Signal are retried once in plain-text mode before counting as a failure.
+- **No concurrent double-claim.** A single `UPDATE ... RETURNING` guarantees that two ticks racing on the same row can't both enter the send phase — only one sees it in the result set.
+- **Duplicate window.** If the gateway crashes after the channel API returned success but before `sent_at` is persisted, the row is re-sent after the reservation expires. A crashed-mid-flight tick trades one possible duplicate for not losing the message.
 - **LLM timeout.** The HTTP call to the LLM provider is bounded by a 30 s AbortSignal so a hung provider can't freeze the tick loop; on timeout the batch falls back to the template and is delivered anyway.
 
 ## Channel plugin contract
@@ -105,6 +112,20 @@ If a channel listed in your config isn't registered at service-start time, this 
 ## Delivery failures
 
 Each row has a 5-attempt retry budget. After 5 failed deliveries a row is stamped `failed_at` and skipped on future ticks so a consistently-rejected message can't block the queue. Inspect with `openclaw notify list --failed` and retry (or drop) manually.
+
+## Troubleshooting
+
+**Notifications are suddenly terse / template-looking.** The LLM batch call is
+failing and the tick is falling back to the per-row template. Check the gateway
+log for `notify: LLM <provider>/<model> failing` — the first fallback per
+(provider, model) per hour is logged at error level with the underlying cause.
+Typical fixes: rotate the API key, or pin `llm.model` to a current model id
+(models get deprecated). Run `openclaw notify doctor` for a live probe.
+
+**Destination never flushes.** A channel plugin listed in `destinations.<name>.channel`
+isn't registered at service-start time. `notify doctor` will flag it, and the
+tick logs a warning at most once per 10 minutes until the channel plugin comes
+online. Rows queued for an unregistered channel are held, not dropped.
 
 ## Data location / uninstall
 

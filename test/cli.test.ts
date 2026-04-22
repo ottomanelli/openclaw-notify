@@ -5,6 +5,8 @@ import os from "node:os";
 import { Command } from "commander";
 import { registerNotifyCli, runDoctor } from "../src/cli.js";
 import { openDb, closeDb } from "../src/db.js";
+import { enqueue } from "../src/queue.js";
+import type { TickResult } from "../src/tick.js";
 import type { NotifyConfig } from "../src/types.js";
 
 let tmpDir: string;
@@ -37,10 +39,14 @@ function defaultRuntime() {
   };
 }
 
-function setup(cfg: NotifyConfig, runtime: ReturnType<typeof defaultRuntime> = defaultRuntime()) {
+function setup(
+  cfg: NotifyConfig,
+  runtime: ReturnType<typeof defaultRuntime> = defaultRuntime(),
+  tickReturn: TickResult | void = undefined,
+) {
   const program = new Command();
   program.exitOverride();
-  const tickFn = vi.fn(async () => {});
+  const tickFn = vi.fn(async (): Promise<TickResult | void> => tickReturn);
   registerNotifyCli({
     program,
     dbPath: path.join(tmpDir, "notifications.db"),
@@ -49,6 +55,16 @@ function setup(cfg: NotifyConfig, runtime: ReturnType<typeof defaultRuntime> = d
     runtime: runtime as never,
   });
   return { program, tickFn, runtime };
+}
+
+function captureStdout() {
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => lines.push(args.map(String).join(" "));
+  return {
+    lines,
+    restore: () => { console.log = orig; },
+  };
 }
 
 describe("cli enqueue", () => {
@@ -175,19 +191,22 @@ describe("cli send", () => {
 
   it("calls tickFn with force=false by default", async () => {
     const { program, tickFn } = setup(baseConfig());
-    await program.parseAsync(["node", "cli", "notify", "send"]);
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
     expect(tickFn).toHaveBeenCalledWith({ force: false, onlyDestination: undefined });
   });
 
   it("passes --force", async () => {
     const { program, tickFn } = setup(baseConfig());
-    await program.parseAsync(["node", "cli", "notify", "send", "--force"]);
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send", "--force"]); } finally { cap.restore(); }
     expect(tickFn).toHaveBeenCalledWith({ force: true, onlyDestination: undefined });
   });
 
   it("passes --destination", async () => {
     const { program, tickFn } = setup(baseConfig());
-    await program.parseAsync(["node", "cli", "notify", "send", "--destination", "work"]);
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send", "--destination", "work"]); } finally { cap.restore(); }
     expect(tickFn).toHaveBeenCalledWith({ force: false, onlyDestination: "work" });
   });
 
@@ -196,6 +215,132 @@ describe("cli send", () => {
     await expect(
       program.parseAsync(["node", "cli", "notify", "send", "--destination", "ghost"]),
     ).rejects.toThrow(/destination/i);
+  });
+
+  it("prints a delivered/failed summary", async () => {
+    const { program } = setup(baseConfig(), defaultRuntime(), {
+      delivered: 3, failedTransient: 1, failedTerminal: 0,
+    });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
+    const out = cap.lines.join("\n");
+    expect(out).toMatch(/delivered 3/);
+    expect(out).toMatch(/failed 1 \(will retry\)/);
+  });
+
+  it("flags terminal failures distinctly from transient ones", async () => {
+    const { program } = setup(baseConfig(), defaultRuntime(), {
+      delivered: 0, failedTransient: 0, failedTerminal: 2,
+    });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toMatch(/failed 2 \(exceeded retry budget\)/);
+  });
+
+  it("reports 'skipped: quiet hours' when the tick was blocked", async () => {
+    const { program } = setup(baseConfig(), defaultRuntime(), {
+      delivered: 0, failedTransient: 0, failedTerminal: 0, skipped: "quiet-hours",
+    });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toMatch(/quiet hours/);
+  });
+
+  it("reports 'no pending rows' when the queue was empty", async () => {
+    const { program } = setup(baseConfig(), defaultRuntime(), {
+      delivered: 0, failedTransient: 0, failedTerminal: 0, skipped: "no-rows",
+    });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toMatch(/no pending rows/);
+  });
+
+  it("prints a 'no tick ran' hint when the plugin short-circuited", async () => {
+    const { program } = setup(baseConfig());  // default tickFn returns void
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toMatch(/no tick ran/);
+  });
+});
+
+describe("cli retry", () => {
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "notify-retry-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function seedFailedRow(): number {
+    const db = openDb(path.join(tmpDir, "notifications.db"));
+    try {
+      const id = enqueue(db, {
+        source: "todo", category: null, destination: "default",
+        rawData: { text: "x" }, shouldFormat: false, dedupKey: null,
+      });
+      db.prepare("UPDATE notifications SET failed_at = ?, delivery_attempts = 5 WHERE id = ?").run(Date.now(), id);
+      return id;
+    } finally {
+      closeDb(db);
+    }
+  }
+
+  it("requires --id or --all", async () => {
+    const { program } = setup(baseConfig());
+    await expect(
+      program.parseAsync(["node", "cli", "notify", "retry"]),
+    ).rejects.toThrow(/--id|--all/);
+  });
+
+  it("--id clears failed_at on that row and leaves others alone", async () => {
+    const a = seedFailedRow();
+    const b = seedFailedRow();
+    const { program } = setup(baseConfig());
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "retry", "--id", String(a)]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toMatch(new RegExp(`retried ${a}`));
+    const db = openDb(path.join(tmpDir, "notifications.db"));
+    try {
+      const rowA = db.prepare("SELECT failed_at, delivery_attempts FROM notifications WHERE id = ?").get(a) as { failed_at: number | null; delivery_attempts: number };
+      const rowB = db.prepare("SELECT failed_at, delivery_attempts FROM notifications WHERE id = ?").get(b) as { failed_at: number | null; delivery_attempts: number };
+      expect(rowA.failed_at).toBeNull();
+      expect(rowA.delivery_attempts).toBe(0);
+      expect(rowB.failed_at).not.toBeNull();
+      expect(rowB.delivery_attempts).toBe(5);
+    } finally {
+      closeDb(db);
+    }
+  });
+
+  it("--id that doesn't name a failed row is a no-op with a clear message", async () => {
+    const { program } = setup(baseConfig());
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "retry", "--id", "999"]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toMatch(/no failed row with id 999/);
+  });
+
+  it("--all clears every failed row and reports the count", async () => {
+    seedFailedRow();
+    seedFailedRow();
+    seedFailedRow();
+    const { program } = setup(baseConfig());
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "retry", "--all"]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toMatch(/retried 3/);
+    const db = openDb(path.join(tmpDir, "notifications.db"));
+    try {
+      const remaining = db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE failed_at IS NOT NULL").get() as { c: number };
+      expect(remaining.c).toBe(0);
+    } finally {
+      closeDb(db);
+    }
+  });
+
+  it("rejects a non-positive --id value", async () => {
+    const { program } = setup(baseConfig());
+    await expect(
+      program.parseAsync(["node", "cli", "notify", "retry", "--id", "0"]),
+    ).rejects.toThrow(/positive integer/);
   });
 });
 
@@ -397,5 +542,29 @@ describe("cli doctor", () => {
     });
     expect(report.lines.join("\n")).toMatch(/queue: 1 pending, 1 failed, oldest pending 3m old/);
     expect(report.lines.join("\n")).toMatch(/notify list --failed/);
+  });
+
+  it("flags unsent rows bound to destinations that are no longer in config", async () => {
+    const dbPath = path.join(tmpDir, "notifications.db");
+    const db = openDb(dbPath);
+    const now = Date.now();
+    // A row for a destination the current config doesn't define (e.g. the
+    // operator renamed "family" to "home" but rows are still queued).
+    db.prepare(
+      "INSERT INTO notifications (source, category, destination, raw_data, should_format, dedup_key, created_at) VALUES (?,?,?,?,?,?,?)",
+    ).run("todo", null, "family", JSON.stringify({ text: "orphan" }), 0, null, now);
+    db.prepare(
+      "INSERT INTO notifications (source, category, destination, raw_data, should_format, dedup_key, created_at) VALUES (?,?,?,?,?,?,?)",
+    ).run("todo", null, "family", JSON.stringify({ text: "orphan2" }), 0, null, now);
+    closeDb(db);
+
+    const report = await runDoctor({
+      dbPath,
+      config: baseConfig(),  // only "default" + "work"
+      runtime: defaultRuntime() as never,
+      skipLlm: true,
+    });
+    expect(report.ok).toBe(false);
+    expect(report.lines.join("\n")).toMatch(/2 unsent row\(s\) bound to unknown destination "family"/);
   });
 });

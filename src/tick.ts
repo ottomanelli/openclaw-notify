@@ -18,6 +18,17 @@ export type TickOptions = {
   activeDestinations?: Set<string>;
 };
 
+export type TickResult = {
+  // "quiet-hours": the window blocked the tick (only when force=false).
+  // "no-rows": nothing pending. Included so callers can tell "nothing to do"
+  // from "quiet hours silenced you."
+  // undefined: at least one destination was attempted.
+  skipped?: "quiet-hours" | "no-rows";
+  delivered: number;        // rows stamped sent_at this tick
+  failedTransient: number;  // rows released for retry on the next tick
+  failedTerminal: number;   // rows that crossed MAX_DELIVERY_ATTEMPTS
+};
+
 // Throttle per destination-name so a misconfigured destination doesn't spam
 // one warning per tick. A 10-minute floor matches the validation-error
 // throttle in index.ts.
@@ -37,14 +48,16 @@ export async function tick(
   runtime: RuntimeBridge,
   logger: TickLogger,
   opts: TickOptions = {},
-): Promise<void> {
+): Promise<TickResult> {
+  const result: TickResult = { delivered: 0, failedTransient: 0, failedTerminal: 0 };
+
   if (!opts.force && nowInQuietHours(cfg.quietHours)) {
     logger.debug("notify: quiet hours — skipping tick");
-    return;
+    return { ...result, skipped: "quiet-hours" };
   }
 
   const rows = getPending(db);
-  if (rows.length === 0) return;
+  if (rows.length === 0) return { ...result, skipped: "no-rows" };
 
   const groups = new Map<string, QueueRow[]>();
   for (const r of rows) {
@@ -94,12 +107,15 @@ export async function tick(
         const message = batch.useLlm
           ? await formatBatch(runtime, claimed, cfg.llm, cfg.personality, { channel: destCfg.channel, logger })
           : renderTemplate(claimed, destCfg.channel);
-        const result = await deliver(runtime, destCfg, message);
-        if (result.ok) {
+        const deliveryResult = await deliver(runtime, destCfg, message);
+        if (deliveryResult.ok) {
           markSent(db, claimedIds);
+          result.delivered += claimedIds.length;
         } else {
-          const { failed } = releaseRows(db, claimedIds);
-          logger.warn(`notify: delivery to "${destName}" failed (${claimed.length} rows): ${result.error}`);
+          const { retried, failed } = releaseRows(db, claimedIds);
+          result.failedTransient += retried.length;
+          result.failedTerminal += failed.length;
+          logger.warn(`notify: delivery to "${destName}" failed (${claimed.length} rows): ${deliveryResult.error}`);
           if (failed.length > 0) {
             logger.error(
               `notify: ${failed.length} row(s) exceeded max delivery attempts for "${destName}" and were moved to failed state (ids: ${failed.join(", ")})`,
@@ -107,7 +123,9 @@ export async function tick(
           }
         }
       } catch (err) {
-        const { failed } = releaseRows(db, claimedIds);
+        const { retried, failed } = releaseRows(db, claimedIds);
+        result.failedTransient += retried.length;
+        result.failedTerminal += failed.length;
         logger.warn(
           `notify: tick batch threw for "${destName}" (${claimed.length} rows): ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -119,4 +137,5 @@ export async function tick(
       }
     }
   }
+  return result;
 }

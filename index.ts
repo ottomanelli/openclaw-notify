@@ -8,7 +8,7 @@ import { resolveConfig } from "./src/config.js";
 import { openDb, closeDb } from "./src/db.js";
 import { registerNotifyCli } from "./src/cli.js";
 import { createNotifyService } from "./src/service.js";
-import { tick, type TickLogger } from "./src/tick.js";
+import { tick, type TickLogger, type TickResult } from "./src/tick.js";
 import { validateDestinations } from "./src/validate.js";
 import type { RuntimeBridge } from "./src/types.js";
 
@@ -68,12 +68,12 @@ const notifyPlugin: OpenClawPluginDefinition = {
       }
     };
 
-    const tickFn = async (opts: { force: boolean; onlyDestination?: string }) => {
+    const tickFn = async (opts: { force: boolean; onlyDestination?: string }): Promise<TickResult | void> => {
       const active = ensureValidated();
       if (!active) return;
       const db = openDb(dbPath);
       try {
-        await tick(db, config, runtime, logger, { ...opts, activeDestinations: active });
+        return await tick(db, config, runtime, logger, { ...opts, activeDestinations: active });
       } finally {
         closeDb(db);
       }
@@ -103,7 +103,7 @@ const notifyPlugin: OpenClawPluginDefinition = {
         if (!ensureValidated()) return;
         const svc = createNotifyService({
           intervalMs: config.tickIntervalSec * 1000,
-          tickFn: () => tickFn({ force: false }),
+          tickFn: async () => { await tickFn({ force: false }); },
           onError: (err) => logger.error(`notify: tick failed: ${err instanceof Error ? err.message : String(err)}`),
         });
         await svc.start();

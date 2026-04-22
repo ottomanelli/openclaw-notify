@@ -65,9 +65,30 @@ describe("tick", () => {
     enqueue(db, { source: "a", category: null, destination: "default", rawData: { text: "x" }, shouldFormat: false, dedupKey: null });
     const { runtime, sends } = fakeRuntime();
     const cfg = baseConfig({ quietHours: { start: "00:00", end: "23:59", tz: "UTC" } });
-    await tick(db, cfg, runtime as never, logger, { force: false });
+    const r = await tick(db, cfg, runtime as never, logger, { force: false });
     expect(sends).toHaveLength(0);
     expect(getPending(db)).toHaveLength(1);
+    expect(r.skipped).toBe("quiet-hours");
+    expect(r.delivered).toBe(0);
+  });
+
+  it("returns skipped:no-rows when the queue is empty", async () => {
+    const { runtime } = fakeRuntime();
+    const r = await tick(db, baseConfig(), runtime as never, logger, { force: false });
+    expect(r.skipped).toBe("no-rows");
+    expect(r.delivered).toBe(0);
+  });
+
+  it("returns counts that reflect deliveries and transient failures", async () => {
+    enqueue(db, { source: "a", category: null, destination: "default", rawData: { text: "ok" }, shouldFormat: false, dedupKey: null });
+    enqueue(db, { source: "b", category: null, destination: "work", rawData: { text: "fail" }, shouldFormat: false, dedupKey: null });
+    const { runtime, sendMessageSlack } = fakeRuntime();
+    sendMessageSlack.mockRejectedValueOnce(new Error("boom"));
+    const r = await tick(db, baseConfig(), runtime as never, logger, { force: false });
+    expect(r.skipped).toBeUndefined();
+    expect(r.delivered).toBe(1);
+    expect(r.failedTransient).toBe(1);
+    expect(r.failedTerminal).toBe(0);
   });
 
   it("delivers to different destinations as separate messages", async () => {

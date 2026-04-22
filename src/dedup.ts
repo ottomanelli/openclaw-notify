@@ -12,6 +12,7 @@ export type DedupOpts = {
 // reclaimed.
 export function findActiveDedupRow(
   db: Db,
+  source: string,
   dedupKey: string,
   destination: string,
   windowMs: number,
@@ -23,14 +24,14 @@ export function findActiveDedupRow(
   return db
     .prepare(
       `SELECT id FROM notifications
-       WHERE dedup_key = ? AND destination = ?
+       WHERE source = ? AND dedup_key = ? AND destination = ?
          AND sent_at IS NULL
          AND failed_at IS NULL
          AND (reserved_at IS NULL OR reserved_at < ? OR reserved_at > ?)
          AND created_at >= ?
        ORDER BY created_at DESC LIMIT 1`,
     )
-    .get(dedupKey, destination, staleBefore, now, cutoff) as { id: number } | undefined ?? null;
+    .get(source, dedupKey, destination, staleBefore, now, cutoff) as { id: number } | undefined ?? null;
 }
 
 export function updateDedupRow(

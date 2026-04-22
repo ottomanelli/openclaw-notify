@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { openDb, closeDb, type Db } from "../src/db.js";
-import { enqueue, getPending, markSent, purge, claimRows, releaseRows, MAX_PER_TICK, RESERVATION_TIMEOUT_MS, MAX_DELIVERY_ATTEMPTS } from "../src/queue.js";
+import { enqueue, getPending, markSent, purge, claimRows, releaseRows, retryFailed, MAX_PER_TICK, RESERVATION_TIMEOUT_MS, MAX_DELIVERY_ATTEMPTS } from "../src/queue.js";
 
 let tmpDir: string;
 let db: Db;
@@ -98,6 +98,19 @@ describe("dedup", () => {
     expect(rows).toHaveLength(2);
     const texts = rows.map((r) => JSON.parse(r.raw_data).text).sort();
     expect(texts).toEqual(["personal", "workly"]);
+  });
+
+  it("does not collide across different sources with the same dedup_key", () => {
+    // Two consumers can both pick an ergonomic key like "reminder:1" without
+    // stepping on each other — the dedup scope is (source, dedup_key).
+    const dedupWindowMin = 15;
+    const id1 = enqueue(db, { source: "todo",     category: null, destination: "default", rawData: { text: "from todo"     }, shouldFormat: false, dedupKey: "reminder:1" }, { dedupWindowMin });
+    const id2 = enqueue(db, { source: "calendar", category: null, destination: "default", rawData: { text: "from calendar" }, shouldFormat: false, dedupKey: "reminder:1" }, { dedupWindowMin });
+    expect(id1).not.toBe(id2);
+    const rows = getPending(db);
+    expect(rows).toHaveLength(2);
+    const texts = rows.map((r) => JSON.parse(r.raw_data).text).sort();
+    expect(texts).toEqual(["from calendar", "from todo"]);
   });
 });
 
@@ -274,6 +287,62 @@ describe("queue retry budget", () => {
     db.prepare("UPDATE notifications SET reserved_at = ? WHERE id = ?").run(Date.now() + 24 * 3600_000, id);
     expect(getPending(db)).toHaveLength(1);
     expect(claimRows(db, [id])).toHaveLength(1);
+  });
+});
+
+describe("retryFailed", () => {
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "notify-retry-failed-"));
+    db = openDb(path.join(tmpDir, "notifications.db"));
+  });
+  afterEach(() => {
+    closeDb(db);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function seedFailed(text: string): number {
+    const id = enqueue(db, { source: "a", category: null, destination: "default", rawData: { text }, shouldFormat: false, dedupKey: null });
+    db.prepare("UPDATE notifications SET failed_at = ?, delivery_attempts = ? WHERE id = ?").run(Date.now(), MAX_DELIVERY_ATTEMPTS, id);
+    return id;
+  }
+
+  it("clears failed_at, delivery_attempts, and reserved_at for the named id", () => {
+    const id = seedFailed("x");
+    db.prepare("UPDATE notifications SET reserved_at = ? WHERE id = ?").run(Date.now(), id);
+    const changed = retryFailed(db, [id]);
+    expect(changed).toBe(1);
+    const row = db.prepare("SELECT failed_at, delivery_attempts, reserved_at FROM notifications WHERE id = ?").get(id) as { failed_at: number | null; delivery_attempts: number; reserved_at: number | null };
+    expect(row.failed_at).toBeNull();
+    expect(row.delivery_attempts).toBe(0);
+    expect(row.reserved_at).toBeNull();
+    // Row should now appear as pending.
+    expect(getPending(db).map((r) => r.id)).toContain(id);
+  });
+
+  it("reports 0 changes when the id exists but isn't failed", () => {
+    const id = enqueue(db, { source: "a", category: null, destination: "default", rawData: { text: "still pending" }, shouldFormat: false, dedupKey: null });
+    const changed = retryFailed(db, [id]);
+    expect(changed).toBe(0);
+  });
+
+  it("retryFailed() with no ids clears every failed row", () => {
+    seedFailed("a");
+    seedFailed("b");
+    seedFailed("c");
+    const pendingId = enqueue(db, { source: "x", category: null, destination: "default", rawData: { text: "still pending" }, shouldFormat: false, dedupKey: null });
+    const changed = retryFailed(db);
+    expect(changed).toBe(3);
+    const stillFailed = db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE failed_at IS NOT NULL").get() as { c: number };
+    expect(stillFailed.c).toBe(0);
+    // And doesn't touch the one that was never failed.
+    const pending = db.prepare("SELECT delivery_attempts FROM notifications WHERE id = ?").get(pendingId) as { delivery_attempts: number };
+    expect(pending.delivery_attempts).toBe(0);
+  });
+
+  it("retryFailed([]) is a no-op and returns 0", () => {
+    seedFailed("a");
+    const changed = retryFailed(db, []);
+    expect(changed).toBe(0);
   });
 });
 

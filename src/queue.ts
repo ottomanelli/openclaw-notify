@@ -34,6 +34,7 @@ export function enqueue(db: Db, input: EnqueueInput, opts?: DedupOpts): number {
     const windowMs = opts.dedupWindowMin * 60_000;
     const existing = findActiveDedupRow(
       db,
+      input.source,
       input.dedupKey,
       input.destination,
       windowMs,
@@ -146,6 +147,33 @@ export function markSent(db: Db, ids: number[]): void {
     stmt.run(now, ...idList);
   });
   tx(ids);
+}
+
+// Reset failed rows so they become eligible again. Clears failed_at,
+// delivery_attempts, and reserved_at so the row enters the next tick
+// exactly as a fresh enqueue would. If `ids` is omitted all failed rows
+// are retried. Returns the number of rows touched.
+export function retryFailed(db: Db, ids?: number[]): number {
+  if (ids && ids.length === 0) return 0;
+  if (ids) {
+    const placeholders = ids.map(() => "?").join(",");
+    const res = db
+      .prepare(
+        `UPDATE notifications
+         SET failed_at = NULL, delivery_attempts = 0, reserved_at = NULL
+         WHERE id IN (${placeholders}) AND failed_at IS NOT NULL`,
+      )
+      .run(...ids);
+    return res.changes;
+  }
+  const res = db
+    .prepare(
+      `UPDATE notifications
+       SET failed_at = NULL, delivery_attempts = 0, reserved_at = NULL
+       WHERE failed_at IS NOT NULL`,
+    )
+    .run();
+  return res.changes;
 }
 
 export function purge(db: Db, olderThanDays: number): number {

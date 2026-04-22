@@ -19,11 +19,13 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_pending
   ON notifications (sent_at, destination, created_at);
--- Dedup filters by (dedup_key, destination, sent_at IS NULL, reserved_at,
--- created_at). Including destination keeps a concurrent queue with many
--- destinations from degrading the dedup lookup to a range scan per row.
+-- Dedup filters by (source, dedup_key, destination, sent_at IS NULL,
+-- reserved_at, created_at). Source is in the key so two consumers can both
+-- use an ergonomic key like "reminder:42" without colliding. Including
+-- destination keeps a concurrent queue with many destinations from
+-- degrading the dedup lookup to a range scan per row.
 CREATE INDEX IF NOT EXISTS idx_notifications_dedup
-  ON notifications (dedup_key, destination, sent_at);
+  ON notifications (source, dedup_key, destination, sent_at);
 `;
 
 export function openDb(dbPath: string): Db {

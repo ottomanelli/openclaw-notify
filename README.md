@@ -8,7 +8,7 @@ Shared notifications queue for OpenClaw with batched LLM-formatted delivery. Con
 - **Multi-destination routing** — route `--destination work` to Slack and the rest to Telegram (or iMessage / Discord / Signal).
 - **LLM formatting via your OpenClaw keys** — no per-skill API keys. Cheap model auto-selected per provider.
 - **Quiet hours** — TZ-aware window that accumulates notifications and flushes on the other side.
-- **Dedup** — consumers pass a `--dedup-key`; repeated enqueues within a window update the pending row in place. Once a row has been claimed by a tick, further enqueues with the same key insert a new row (safer than mutating a row that's mid-delivery).
+- **Dedup** — consumers pass a `--dedup-key`; repeated enqueues within a window update the pending row in place. Dedup is scoped to `(source, dedup_key, destination)`, so `todo` and `calendar` can both use `--dedup-key reminder:1` without colliding. Once a row has been claimed by a tick, further enqueues with the same key insert a new row (safer than mutating a row that's mid-delivery).
 
 ## Install
 
@@ -61,8 +61,18 @@ openclaw notify list              # print pending rows as JSON
 openclaw notify list --failed     # only rows that exceeded the retry budget
 openclaw notify list --all        # include sent and failed rows
 openclaw notify purge --older-than 30d
+openclaw notify retry --id 42     # reset one failed row so the next tick re-delivers
+openclaw notify retry --all       # reset every failed row
 openclaw notify doctor            # probe config, destinations, LLM, and queue
 openclaw notify doctor --skip-llm # skip the live LLM API probe
+```
+
+`notify send` prints a one-line summary so callers can see what happened:
+
+```
+delivered 3, failed 1 (will retry)
+skipped: quiet hours (pass --force to override)
+no pending rows
 ```
 
 `notify doctor` exits non-zero when anything is unhealthy (a destination channel isn't registered, the configured LLM provider has no key, the live LLM probe fails, etc.), so it composes cleanly with shell scripts, CI checks, and systemd `ExecStartPre=`.
@@ -111,7 +121,7 @@ If a channel listed in your config isn't registered at service-start time, this 
 
 ## Delivery failures
 
-Each row has a 5-attempt retry budget. After 5 failed deliveries a row is stamped `failed_at` and skipped on future ticks so a consistently-rejected message can't block the queue. Inspect with `openclaw notify list --failed` and retry (or drop) manually.
+Each row has a 5-attempt retry budget. After 5 failed deliveries a row is stamped `failed_at` and skipped on future ticks so a consistently-rejected message can't block the queue. Inspect with `openclaw notify list --failed` and either re-deliver with `openclaw notify retry --id <n>` (or `--all`) or delete the row with a direct SQL `DELETE`.
 
 ## Troubleshooting
 

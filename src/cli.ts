@@ -1,7 +1,8 @@
 import type { Command } from "commander";
 import type { NotifyConfig, RuntimeBridge } from "./types.js";
 import { openDb, closeDb } from "./db.js";
-import { enqueue, purge } from "./queue.js";
+import { enqueue, purge, retryFailed } from "./queue.js";
+import type { TickResult } from "./tick.js";
 import { callLlm, selectProviderAndModel } from "./format.js";
 import { SEND_FN_BY_CHANNEL } from "./validate.js";
 
@@ -24,7 +25,7 @@ export type CliDeps = {
   program: Command;
   dbPath: string;
   config: NotifyConfig;
-  tickFn: (opts: { force: boolean; onlyDestination?: string }) => Promise<void>;
+  tickFn: (opts: { force: boolean; onlyDestination?: string }) => Promise<TickResult | void>;
   runtime: RuntimeBridge;
 };
 
@@ -96,7 +97,51 @@ export function registerNotifyCli(deps: CliDeps): void {
       if (opts.destination && !(opts.destination in config.destinations)) {
         throw new Error(`Unknown --destination "${opts.destination}"`);
       }
-      await deps.tickFn({ force: !!opts.force, onlyDestination: opts.destination });
+      const r = await deps.tickFn({ force: !!opts.force, onlyDestination: opts.destination });
+      // If the plugin entrypoint short-circuited (e.g. destinations failed to
+      // validate), we get void — print something so `notify send` is never
+      // silent.
+      if (!r) {
+        console.log("no tick ran (destinations unvalidated; check logs)");
+        return;
+      }
+      if (r.skipped === "quiet-hours") {
+        console.log("skipped: quiet hours (pass --force to override)");
+      } else if (r.skipped === "no-rows") {
+        console.log("no pending rows");
+      } else {
+        const parts = [`delivered ${r.delivered}`];
+        if (r.failedTransient > 0) parts.push(`failed ${r.failedTransient} (will retry)`);
+        if (r.failedTerminal > 0) parts.push(`failed ${r.failedTerminal} (exceeded retry budget)`);
+        console.log(parts.join(", "));
+      }
+    });
+
+  notify
+    .command("retry")
+    .description("Reset rows stamped failed_at so the next tick will re-deliver")
+    .option("--id <n>", "Only retry this id")
+    .option("--all", "Retry every failed row", false)
+    .action(async (opts: { id?: string; all?: boolean }) => {
+      if (!opts.id && !opts.all) {
+        throw new Error("notify retry: pass --id <n> or --all");
+      }
+      const db = openDb(dbPath);
+      try {
+        if (opts.id) {
+          const n = Number(opts.id);
+          if (!Number.isInteger(n) || n <= 0) {
+            throw new Error(`--id must be a positive integer, got "${opts.id}"`);
+          }
+          const changed = retryFailed(db, [n]);
+          console.log(changed === 1 ? `retried ${n}` : `no failed row with id ${n}`);
+        } else {
+          const changed = retryFailed(db);
+          console.log(`retried ${changed}`);
+        }
+      } finally {
+        closeDb(db);
+      }
     });
 
   notify
@@ -233,6 +278,25 @@ export async function runDoctor(params: {
     const marker = failed.c > 0 ? "•" : "✓";
     lines.push(`${marker} ${queueLine}`);
     if (failed.c > 0) lines.push(`  → run "openclaw notify list --failed" to inspect`);
+
+    // Orphan check: rows pinned to a destination the config no longer
+    // defines. Those rows will never deliver until the destination comes
+    // back or an operator reroutes them.
+    const stranded = db
+      .prepare(
+        `SELECT destination, COUNT(*) AS c
+         FROM notifications
+         WHERE sent_at IS NULL
+         GROUP BY destination`,
+      )
+      .all() as { destination: string; c: number }[];
+    const orphans = stranded.filter((r) => !(r.destination in config.destinations));
+    if (orphans.length > 0) {
+      ok = false;
+      for (const o of orphans) {
+        lines.push(`✗ ${o.c} unsent row(s) bound to unknown destination "${o.destination}" (not in current config)`);
+      }
+    }
   } finally {
     closeDb(db);
   }

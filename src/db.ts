@@ -40,13 +40,32 @@ export function openDb(dbPath: string): Db {
   // Retry inside SQLite for up to 5 s first.
   db.pragma("busy_timeout = 5000");
   db.exec(SCHEMA);
-  // Idempotent column add — on a fresh install the column already exists
-  // via SCHEMA; on an upgrade from an earlier version this installs it
-  // without touching data. Uses pragma instead of try/catch so a real DDL
-  // error still surfaces.
-  const cols = db.pragma("table_info(notifications)") as Array<{ name: string }>;
-  if (!cols.some((c) => c.name === "next_attempt_at")) {
-    db.exec("ALTER TABLE notifications ADD COLUMN next_attempt_at INTEGER");
+  // Idempotent column upgrades for installs predating later schema
+  // revisions. CREATE TABLE IF NOT EXISTS won't add new columns to an
+  // existing table, so each column added after the initial publish needs
+  // its own ALTER. Order matters: keep the earliest-added column first.
+  const existing = new Set(
+    (db.pragma("table_info(notifications)") as Array<{ name: string }>).map((c) => c.name),
+  );
+  const COLUMN_UPGRADES: Array<{ name: string; ddl: string }> = [
+    { name: "delivery_attempts", ddl: "ALTER TABLE notifications ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0" },
+    { name: "failed_at", ddl: "ALTER TABLE notifications ADD COLUMN failed_at INTEGER" },
+    { name: "next_attempt_at", ddl: "ALTER TABLE notifications ADD COLUMN next_attempt_at INTEGER" },
+  ];
+  for (const u of COLUMN_UPGRADES) {
+    if (!existing.has(u.name)) db.exec(u.ddl);
+  }
+  // Index upgrade: the dedup index used to be (dedup_key, sent_at) before
+  // we scoped dedup to (source, dedup_key, destination). CREATE INDEX IF
+  // NOT EXISTS won't replace an index of the same name with a different
+  // shape, so detect drift and DROP+recreate.
+  const dedupCols = (db.pragma("index_info(idx_notifications_dedup)") as Array<{ name: string }>).map((c) => c.name);
+  const wantedDedup = ["source", "dedup_key", "destination", "sent_at"];
+  const dedupOutdated = dedupCols.length > 0 &&
+    (dedupCols.length !== wantedDedup.length || dedupCols.some((c, i) => c !== wantedDedup[i]));
+  if (dedupOutdated) {
+    db.exec("DROP INDEX idx_notifications_dedup");
+    db.exec("CREATE INDEX idx_notifications_dedup ON notifications (source, dedup_key, destination, sent_at)");
   }
   // Notification content can include personal reminders, calendar subjects,
   // etc. Default umask leaves the file world-readable; tighten it. No-op on

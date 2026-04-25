@@ -159,6 +159,20 @@ describe("cli enqueue", () => {
     ).rejects.toThrow(/text/i);
   });
 
+  it("rejects --data over the total JSON length cap (defends against giant extra fields)", async () => {
+    const { program } = setup(baseConfig());
+    // Short `text` to get past the text-length check, but a huge sibling
+    // field that would bloat raw_data if we didn't cap the whole JSON.
+    const big = JSON.stringify({ text: "ok", blob: "x".repeat(10_000) });
+    await expect(
+      program.parseAsync([
+        "node", "cli", "notify", "enqueue",
+        "--source", "s",
+        "--data", big,
+      ]),
+    ).rejects.toThrow(/data too long/i);
+  });
+
   it("--no-format sets should_format=0", async () => {
     const { program } = setup(baseConfig());
     const origLog = console.log;
@@ -252,7 +266,31 @@ describe("cli send", () => {
     });
     const cap = captureStdout();
     try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
-    expect(cap.lines.join("\n")).toMatch(/no pending rows/);
+    expect(cap.lines.join("\n")).toEqual("no pending rows");
+  });
+
+  it("surfaces backing-off rows in the 'no pending' message", async () => {
+    // A row with next_attempt_at > now looks like an empty queue to getPending
+    // (and so tick returns skipped: "no-rows"), but the send summary should
+    // tell the operator a retry is pending rather than silently lying.
+    const dbPath = path.join(tmpDir, "notifications.db");
+    const db = openDb(dbPath);
+    try {
+      enqueue(db, {
+        source: "a", category: null, destination: "default",
+        rawData: { text: "x" }, shouldFormat: false, dedupKey: null,
+      });
+      db.prepare("UPDATE notifications SET next_attempt_at = ? WHERE id = 1")
+        .run(Date.now() + 8 * 60_000);
+    } finally {
+      closeDb(db);
+    }
+    const { program } = setup(baseConfig(), defaultRuntime(), {
+      delivered: 0, failedTransient: 0, failedTerminal: 0, skipped: "no-rows",
+    });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toMatch(/no pending rows \(1 backing off, next in \d+m\)/);
   });
 
   it("prints a 'no tick ran' hint when the plugin short-circuited", async () => {
@@ -542,6 +580,32 @@ describe("cli doctor", () => {
     });
     expect(report.lines.join("\n")).toMatch(/queue: 1 pending, 1 failed, oldest pending 3m old/);
     expect(report.lines.join("\n")).toMatch(/notify list --failed/);
+  });
+
+  it("separates backing-off rows from ready-now ones in the queue line", async () => {
+    const dbPath = path.join(tmpDir, "notifications.db");
+    const db = openDb(dbPath);
+    const now = Date.now();
+    // One ready row.
+    db.prepare(
+      "INSERT INTO notifications (source, category, destination, raw_data, should_format, dedup_key, created_at) VALUES (?,?,?,?,?,?,?)",
+    ).run("todo", null, "default", JSON.stringify({ text: "ready" }), 0, null, now - 120_000);
+    // Two backing-off rows (failed once, waiting on backoff).
+    db.prepare(
+      "INSERT INTO notifications (source, category, destination, raw_data, should_format, dedup_key, created_at, delivery_attempts, next_attempt_at) VALUES (?,?,?,?,?,?,?,?,?)",
+    ).run("todo", null, "default", JSON.stringify({ text: "wait1" }), 0, null, now - 60_000, 1, now + 5 * 60_000);
+    db.prepare(
+      "INSERT INTO notifications (source, category, destination, raw_data, should_format, dedup_key, created_at, delivery_attempts, next_attempt_at) VALUES (?,?,?,?,?,?,?,?,?)",
+    ).run("todo", null, "default", JSON.stringify({ text: "wait2" }), 0, null, now - 30_000, 2, now + 15 * 60_000);
+    closeDb(db);
+
+    const report = await runDoctor({
+      dbPath,
+      config: baseConfig(),
+      runtime: defaultRuntime() as never,
+      skipLlm: true,
+    });
+    expect(report.lines.join("\n")).toMatch(/queue: 1 pending \(2 backing off\), 0 failed/);
   });
 
   it("flags unsent rows bound to destinations that are no longer in config", async () => {

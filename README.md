@@ -73,6 +73,7 @@ openclaw notify doctor --skip-llm # skip the live LLM API probe
 delivered 3, failed 1 (will retry)
 skipped: quiet hours (pass --force to override)
 no pending rows
+no pending rows (2 backing off, next in 8m)
 ```
 
 `notify doctor` exits non-zero when anything is unhealthy (a destination channel isn't registered, the configured LLM provider has no key, the live LLM probe fails, etc.), so it composes cleanly with shell scripts, CI checks, and systemd `ExecStartPre=`.
@@ -98,8 +99,10 @@ Each batch generates a fresh random 8-hex nonce. Every piece of consumer text is
 Delivery is **at-least-once**. Duplicates are rare but possible (see the duplicate window below); for notification workloads that's an acceptable trade. If you need exactly-once, dedupe on the receiver side by `(source, category, time-bucket)`.
 
 - **Crash recovery.** Rows are atomically claimed via `UPDATE ... RETURNING` before delivery. If a tick process crashes between claim and `sent_at` being stamped, the reservation times out after 10 minutes and the row becomes eligible again.
-- **Retry.** On delivery failure the reservation is released immediately; the next tick picks the row up. Markdown parse errors on Telegram/Signal are retried once in plain-text mode before counting as a failure.
+- **Retry with exponential backoff.** Delivery failures schedule `next_attempt_at = now + backoff(attempts)`. Schedule: `2 min → 10 min → 30 min → 2 h → 6 h → 12 h → 24 h → 24 h → 24 h`, then tombstone after 10 failed attempts (~3.8 days of coverage). A channel outage that lasts a few hours recovers without operator action. Markdown parse errors on Telegram/Signal are retried once in plain-text mode before counting as a failure.
+- **Tombstoned rows are not auto-retried.** After 10 failures the row is stamped `failed_at`; `notify doctor` surfaces the count and `notify retry --id <n>` (or `--all`) re-enters it with a fresh budget.
 - **No concurrent double-claim.** A single `UPDATE ... RETURNING` guarantees that two ticks racing on the same row can't both enter the send phase — only one sees it in the result set.
+- **Concurrent processes.** The CLI and service each open the same SQLite file in WAL mode with `busy_timeout = 5 s`, so transient lock contention on a simultaneous enqueue retries inside SQLite rather than raising `SQLITE_BUSY`.
 - **Duplicate window.** If the gateway crashes after the channel API returned success but before `sent_at` is persisted, the row is re-sent after the reservation expires. A crashed-mid-flight tick trades one possible duplicate for not losing the message.
 - **LLM timeout.** The HTTP call to the LLM provider is bounded by a 30 s AbortSignal so a hung provider can't freeze the tick loop; on timeout the batch falls back to the template and is delivered anyway.
 
@@ -121,7 +124,7 @@ If a channel listed in your config isn't registered at service-start time, this 
 
 ## Delivery failures
 
-Each row has a 5-attempt retry budget. After 5 failed deliveries a row is stamped `failed_at` and skipped on future ticks so a consistently-rejected message can't block the queue. Inspect with `openclaw notify list --failed` and either re-deliver with `openclaw notify retry --id <n>` (or `--all`) or delete the row with a direct SQL `DELETE`.
+Each row has a 10-attempt budget spread over ~3.8 days of exponential backoff (see Reliability above). After 10 failed deliveries the row is stamped `failed_at` and skipped on future ticks so a permanently-broken message can't loop forever. Inspect with `openclaw notify list --failed` and either re-deliver with `openclaw notify retry --id <n>` (or `--all`) or delete the row with a direct SQL `DELETE`.
 
 ## Troubleshooting
 
@@ -139,7 +142,7 @@ online. Rows queued for an unregistered channel are held, not dropped.
 
 ## Data location / uninstall
 
-State lives in `~/.openclaw/state/plugins/notify/notifications.db` (a SQLite file with WAL sidecars). Deleting that directory is equivalent to a fresh install. Rows with `sent_at IS NOT NULL` can be garbage-collected via `openclaw notify purge --older-than 30d`.
+State lives in `~/.openclaw/state/plugins/notify/notifications.db` (a SQLite file with WAL sidecars). The DB file is chmod 0600 so only the owning user can read it — notification payloads can include personal reminders and calendar subjects. Deleting that directory is equivalent to a fresh install. Rows with `sent_at IS NOT NULL` can be garbage-collected via `openclaw notify purge --older-than 30d`.
 
 ## License
 

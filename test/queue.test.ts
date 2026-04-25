@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { openDb, closeDb, type Db } from "../src/db.js";
-import { enqueue, getPending, markSent, purge, claimRows, releaseRows, retryFailed, MAX_PER_TICK, RESERVATION_TIMEOUT_MS, MAX_DELIVERY_ATTEMPTS } from "../src/queue.js";
+import { enqueue, getPending, markSent, purge, claimRows, releaseRows, retryFailed, backoffMsForAttempts, MAX_PER_TICK, RESERVATION_TIMEOUT_MS, MAX_DELIVERY_ATTEMPTS } from "../src/queue.js";
 
 let tmpDir: string;
 let db: Db;
@@ -134,11 +134,20 @@ describe("queue claim / release", () => {
     expect(getPending(db)).toHaveLength(0);
   });
 
-  it("releaseRows restores reserved rows to getPending", () => {
+  it("releaseRows sets next_attempt_at so the row retries after backoff", () => {
     const id = enqueue(db, { source: "a", category: null, destination: "default", rawData: { text: "x" }, shouldFormat: false, dedupKey: null });
     claimRows(db, [id]);
     expect(getPending(db)).toHaveLength(0);
     releaseRows(db, [id]);
+    // Row is backing off now, NOT immediately retryable.
+    expect(getPending(db)).toHaveLength(0);
+    const row = db.prepare("SELECT next_attempt_at, delivery_attempts, reserved_at FROM notifications WHERE id = ?").get(id) as { next_attempt_at: number | null; delivery_attempts: number; reserved_at: number | null };
+    expect(row.next_attempt_at).not.toBeNull();
+    expect(row.next_attempt_at!).toBeGreaterThan(Date.now());
+    expect(row.delivery_attempts).toBe(1);
+    expect(row.reserved_at).toBeNull();
+    // Simulate time elapsing past the backoff.
+    db.prepare("UPDATE notifications SET next_attempt_at = NULL WHERE id = ?").run(id);
     expect(getPending(db)).toHaveLength(1);
   });
 
@@ -231,21 +240,30 @@ describe("queue retry budget", () => {
     const res = releaseRows(db, [id]);
     expect(res.retried).toEqual([id]);
     expect(res.failed).toEqual([]);
+    // Row is backing off — after clearing the deadline it's pending again.
+    db.prepare("UPDATE notifications SET next_attempt_at = NULL WHERE id = ?").run(id);
     expect(getPending(db)).toHaveLength(1);
   });
 
   it("stamps failed_at and reports the id in `failed` once delivery_attempts >= MAX", () => {
     const id = enqueue(db, { source: "a", category: null, destination: "default", rawData: { text: "x" }, shouldFormat: false, dedupKey: null });
     let lastResult: { retried: number[]; failed: number[] } = { retried: [], failed: [] };
+    // Fast-forward backoff between iterations so each release actually
+    // sees a claim — otherwise claimRows skips the row while it's backing
+    // off and we never reach the failure cap.
     for (let i = 0; i < MAX_DELIVERY_ATTEMPTS; i++) {
+      db.prepare("UPDATE notifications SET next_attempt_at = NULL WHERE id = ?").run(id);
       claimRows(db, [id]);
       lastResult = releaseRows(db, [id]);
     }
     expect(lastResult.failed).toEqual([id]);
     expect(lastResult.retried).toEqual([]);
-    const row = db.prepare("SELECT delivery_attempts, failed_at FROM notifications WHERE id = ?").get(id) as { delivery_attempts: number; failed_at: number | null };
+    const row = db.prepare("SELECT delivery_attempts, failed_at, next_attempt_at FROM notifications WHERE id = ?").get(id) as { delivery_attempts: number; failed_at: number | null; next_attempt_at: number | null };
     expect(row.delivery_attempts).toBeGreaterThanOrEqual(MAX_DELIVERY_ATTEMPTS);
     expect(row.failed_at).not.toBeNull();
+    // When we tombstone we clear next_attempt_at so the row never
+    // resurfaces via backoff.
+    expect(row.next_attempt_at).toBeNull();
   });
 
   it("failed rows are excluded from getPending and not re-claimable", () => {
@@ -255,21 +273,27 @@ describe("queue retry budget", () => {
     expect(claimRows(db, [id])).toHaveLength(0);
   });
 
-  it("dedup re-enqueue resets delivery_attempts and clears reserved_at on a retried row", () => {
+  it("dedup re-enqueue resets delivery_attempts, reserved_at, and next_attempt_at on a retried row", () => {
     const dedupWindowMin = 15;
     const id = enqueue(db, { source: "todo", category: null, destination: "default", rawData: { text: "v1" }, shouldFormat: false, dedupKey: "k1" }, { dedupWindowMin });
-    // Simulate a couple of failed deliveries.
-    claimRows(db, [id]);
-    releaseRows(db, [id]);
-    claimRows(db, [id]);
-    releaseRows(db, [id]);
-    // Fresh enqueue (same key) should fold in and reset the counter.
+    // Simulate a couple of failed deliveries. Fast-forward backoff between
+    // them so each claim lands a real reservation.
+    for (let i = 0; i < 2; i++) {
+      db.prepare("UPDATE notifications SET next_attempt_at = NULL WHERE id = ?").run(id);
+      claimRows(db, [id]);
+      releaseRows(db, [id]);
+    }
+    // Fresh enqueue (same key) should fold in and clear everything — a new
+    // enqueue is the consumer asking for delivery NOW, not after the old
+    // backoff.
     const id2 = enqueue(db, { source: "todo", category: null, destination: "default", rawData: { text: "v2" }, shouldFormat: false, dedupKey: "k1" }, { dedupWindowMin });
     expect(id2).toBe(id);
-    const row = db.prepare("SELECT delivery_attempts, reserved_at, raw_data FROM notifications WHERE id = ?").get(id) as { delivery_attempts: number; reserved_at: number | null; raw_data: string };
+    const row = db.prepare("SELECT delivery_attempts, reserved_at, next_attempt_at, raw_data FROM notifications WHERE id = ?").get(id) as { delivery_attempts: number; reserved_at: number | null; next_attempt_at: number | null; raw_data: string };
     expect(row.delivery_attempts).toBe(0);
     expect(row.reserved_at).toBeNull();
+    expect(row.next_attempt_at).toBeNull();
     expect(JSON.parse(row.raw_data)).toEqual({ text: "v2" });
+    expect(getPending(db).map((r) => r.id)).toContain(id);
   });
 
   it("does not fold a new dedup enqueue into a row that has already reached failed_at", () => {
@@ -290,6 +314,73 @@ describe("queue retry budget", () => {
   });
 });
 
+describe("backoff", () => {
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "notify-backoff-"));
+    db = openDb(path.join(tmpDir, "notifications.db"));
+  });
+  afterEach(() => {
+    closeDb(db);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("backoff grows with each attempt and caps at 24h", () => {
+    // Schedule: 2m, 10m, 30m, 2h, 6h, 12h, then 24h indefinitely.
+    expect(backoffMsForAttempts(1)).toBe(2 * 60_000);
+    expect(backoffMsForAttempts(2)).toBe(10 * 60_000);
+    expect(backoffMsForAttempts(3)).toBe(30 * 60_000);
+    expect(backoffMsForAttempts(4)).toBe(2 * 3600_000);
+    expect(backoffMsForAttempts(5)).toBe(6 * 3600_000);
+    expect(backoffMsForAttempts(6)).toBe(12 * 3600_000);
+    expect(backoffMsForAttempts(7)).toBe(24 * 3600_000);
+    // Beyond the schedule the cap continues (up to MAX where we tombstone).
+    expect(backoffMsForAttempts(9)).toBe(24 * 3600_000);
+    expect(backoffMsForAttempts(100)).toBe(24 * 3600_000);
+  });
+
+  it("release stamps next_attempt_at = now + backoff(new_attempts)", () => {
+    const id = enqueue(db, { source: "a", category: null, destination: "default", rawData: { text: "x" }, shouldFormat: false, dedupKey: null });
+    claimRows(db, [id]);
+    const before = Date.now();
+    releaseRows(db, [id]);
+    const after = Date.now();
+    const row = db.prepare("SELECT next_attempt_at, delivery_attempts FROM notifications WHERE id = ?").get(id) as { next_attempt_at: number; delivery_attempts: number };
+    expect(row.delivery_attempts).toBe(1);
+    // After attempt 1 failure, deadline = now + 2min.
+    expect(row.next_attempt_at).toBeGreaterThanOrEqual(before + 2 * 60_000);
+    expect(row.next_attempt_at).toBeLessThanOrEqual(after + 2 * 60_000 + 1000);
+  });
+
+  it("getPending excludes rows whose next_attempt_at is in the future", () => {
+    const id = enqueue(db, { source: "a", category: null, destination: "default", rawData: { text: "x" }, shouldFormat: false, dedupKey: null });
+    db.prepare("UPDATE notifications SET next_attempt_at = ? WHERE id = ?").run(Date.now() + 60_000, id);
+    expect(getPending(db)).toHaveLength(0);
+    db.prepare("UPDATE notifications SET next_attempt_at = ? WHERE id = ?").run(Date.now() - 1, id);
+    expect(getPending(db)).toHaveLength(1);
+  });
+
+  it("claimRows refuses a row whose next_attempt_at is still in the future", () => {
+    const id = enqueue(db, { source: "a", category: null, destination: "default", rawData: { text: "x" }, shouldFormat: false, dedupKey: null });
+    db.prepare("UPDATE notifications SET next_attempt_at = ? WHERE id = ?").run(Date.now() + 60_000, id);
+    expect(claimRows(db, [id])).toHaveLength(0);
+    // Once the deadline elapses the claim proceeds.
+    db.prepare("UPDATE notifications SET next_attempt_at = ? WHERE id = ?").run(Date.now() - 1, id);
+    expect(claimRows(db, [id])).toHaveLength(1);
+  });
+
+  it("tombstoning at MAX_DELIVERY_ATTEMPTS clears next_attempt_at (backoff doesn't resurrect failed rows)", () => {
+    const id = enqueue(db, { source: "a", category: null, destination: "default", rawData: { text: "x" }, shouldFormat: false, dedupKey: null });
+    for (let i = 0; i < MAX_DELIVERY_ATTEMPTS; i++) {
+      db.prepare("UPDATE notifications SET next_attempt_at = NULL WHERE id = ?").run(id);
+      claimRows(db, [id]);
+      releaseRows(db, [id]);
+    }
+    const row = db.prepare("SELECT failed_at, next_attempt_at FROM notifications WHERE id = ?").get(id) as { failed_at: number | null; next_attempt_at: number | null };
+    expect(row.failed_at).not.toBeNull();
+    expect(row.next_attempt_at).toBeNull();
+  });
+});
+
 describe("retryFailed", () => {
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "notify-retry-failed-"));
@@ -306,15 +397,16 @@ describe("retryFailed", () => {
     return id;
   }
 
-  it("clears failed_at, delivery_attempts, and reserved_at for the named id", () => {
+  it("clears failed_at, delivery_attempts, reserved_at, and next_attempt_at for the named id", () => {
     const id = seedFailed("x");
-    db.prepare("UPDATE notifications SET reserved_at = ? WHERE id = ?").run(Date.now(), id);
+    db.prepare("UPDATE notifications SET reserved_at = ?, next_attempt_at = ? WHERE id = ?").run(Date.now(), Date.now() + 3600_000, id);
     const changed = retryFailed(db, [id]);
     expect(changed).toBe(1);
-    const row = db.prepare("SELECT failed_at, delivery_attempts, reserved_at FROM notifications WHERE id = ?").get(id) as { failed_at: number | null; delivery_attempts: number; reserved_at: number | null };
+    const row = db.prepare("SELECT failed_at, delivery_attempts, reserved_at, next_attempt_at FROM notifications WHERE id = ?").get(id) as { failed_at: number | null; delivery_attempts: number; reserved_at: number | null; next_attempt_at: number | null };
     expect(row.failed_at).toBeNull();
     expect(row.delivery_attempts).toBe(0);
     expect(row.reserved_at).toBeNull();
+    expect(row.next_attempt_at).toBeNull();
     // Row should now appear as pending.
     expect(getPending(db).map((r) => r.id)).toContain(id);
   });

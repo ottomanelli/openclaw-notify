@@ -111,16 +111,20 @@ describe("tick", () => {
     expect(warnSpy).toHaveBeenCalled();
   });
 
-  it("leaves rows unsent when delivery throws", async () => {
+  it("leaves rows unsent when delivery throws and schedules a retry via backoff", async () => {
     enqueue(db, { source: "a", category: null, destination: "default", rawData: { text: "x" }, shouldFormat: false, dedupKey: null });
     const { runtime, sends, sendMessageTelegram } = fakeRuntime();
     sendMessageTelegram.mockRejectedValueOnce(new Error("boom"));
     await tick(db, baseConfig(), runtime as never, logger, { force: false });
-    // Row is released (not stuck reserved) so it shows up for retry next tick.
-    expect(getPending(db)).toHaveLength(1);
     expect(sends).toHaveLength(0);
-    const row = db.prepare("SELECT reserved_at FROM notifications WHERE sent_at IS NULL").get() as { reserved_at: number | null };
+    // Row is released (not stuck reserved) but is now backing off, so
+    // getPending won't re-offer it until the deadline elapses.
+    expect(getPending(db)).toHaveLength(0);
+    const row = db.prepare("SELECT reserved_at, next_attempt_at, delivery_attempts FROM notifications WHERE sent_at IS NULL").get() as { reserved_at: number | null; next_attempt_at: number | null; delivery_attempts: number };
     expect(row.reserved_at).toBeNull();
+    expect(row.next_attempt_at).not.toBeNull();
+    expect(row.next_attempt_at!).toBeGreaterThan(Date.now());
+    expect(row.delivery_attempts).toBe(1);
   });
 
   it("--force bypasses quiet hours", async () => {

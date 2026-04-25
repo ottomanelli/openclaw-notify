@@ -14,6 +14,11 @@ const MAX_DEDUP_KEY_LEN = 256;
 // fallback AND the channel's send API. 4 KB is well above any legitimate
 // reminder payload and well below most channel message limits.
 const MAX_TEXT_LEN = 4096;
+// Hard cap on the full --data JSON string before parsing. Stops a rogue
+// consumer from shoving megabytes of extra fields alongside a short `text`
+// and growing the DB indefinitely (only `text` flows through delivery, but
+// the whole payload is persisted in raw_data).
+const MAX_DATA_JSON_LEN = 8192;
 
 function checkLen(flag: string, val: string | undefined, max: number): void {
   if (val !== undefined && val.length > max) {
@@ -56,6 +61,9 @@ export function registerNotifyCli(deps: CliDeps): void {
       checkLen("source", opts.source, MAX_SOURCE_LEN);
       checkLen("category", opts.category, MAX_CATEGORY_LEN);
       checkLen("dedup-key", opts.dedupKey, MAX_DEDUP_KEY_LEN);
+      if (opts.data.length > MAX_DATA_JSON_LEN) {
+        throw new Error(`--data too long: ${opts.data.length} chars (max ${MAX_DATA_JSON_LEN})`);
+      }
       let parsed: Record<string, unknown>;
       try {
         parsed = JSON.parse(opts.data);
@@ -108,7 +116,29 @@ export function registerNotifyCli(deps: CliDeps): void {
       if (r.skipped === "quiet-hours") {
         console.log("skipped: quiet hours (pass --force to override)");
       } else if (r.skipped === "no-rows") {
-        console.log("no pending rows");
+        // "no-rows" only means the tick found nothing READY — rows that are
+        // backing off after a prior failed delivery are hidden by getPending.
+        // Silently saying "no pending rows" when the queue actually has
+        // retrying rows would mislead an operator investigating "why didn't
+        // my alert fire?", so surface the count and the next deadline.
+        const db = openDb(dbPath);
+        try {
+          const now = Date.now();
+          const row = db
+            .prepare(
+              `SELECT COUNT(*) AS c, MIN(next_attempt_at) AS nextAt
+               FROM notifications
+               WHERE sent_at IS NULL AND failed_at IS NULL AND next_attempt_at > ?`,
+            )
+            .get(now) as { c: number; nextAt: number | null };
+          if (row.c > 0 && row.nextAt != null) {
+            console.log(`no pending rows (${row.c} backing off, next in ${formatRelativeMs(row.nextAt - now)})`);
+          } else {
+            console.log("no pending rows");
+          }
+        } finally {
+          closeDb(db);
+        }
       } else {
         const parts = [`delivered ${r.delivered}`];
         if (r.failedTransient > 0) parts.push(`failed ${r.failedTransient} (will retry)`);
@@ -260,24 +290,32 @@ export async function runDoctor(params: {
 
   const db = openDb(dbPath);
   try {
-    const pending = db
+    const now = Date.now();
+    const stats = db
       .prepare(
-        "SELECT COUNT(*) AS c, MIN(created_at) AS oldest FROM notifications WHERE sent_at IS NULL AND failed_at IS NULL",
+        `SELECT
+           SUM(CASE WHEN sent_at IS NULL AND failed_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?) THEN 1 ELSE 0 END) AS pending,
+           SUM(CASE WHEN sent_at IS NULL AND failed_at IS NULL AND next_attempt_at > ? THEN 1 ELSE 0 END) AS backingOff,
+           SUM(CASE WHEN failed_at IS NOT NULL THEN 1 ELSE 0 END) AS failed,
+           MIN(CASE WHEN sent_at IS NULL AND failed_at IS NULL THEN created_at END) AS oldest
+         FROM notifications`,
       )
-      .get() as { c: number; oldest: number | null };
-    const failed = db
-      .prepare("SELECT COUNT(*) AS c FROM notifications WHERE failed_at IS NOT NULL")
-      .get() as { c: number };
-    let queueLine = `queue: ${pending.c} pending, ${failed.c} failed`;
-    if (pending.oldest != null) {
-      const ageMin = Math.round((Date.now() - pending.oldest) / 60_000);
+      .get(now, now) as { pending: number | null; backingOff: number | null; failed: number | null; oldest: number | null };
+    const pending = stats.pending ?? 0;
+    const backingOff = stats.backingOff ?? 0;
+    const failed = stats.failed ?? 0;
+    let queueLine = `queue: ${pending} pending`;
+    if (backingOff > 0) queueLine += ` (${backingOff} backing off)`;
+    queueLine += `, ${failed} failed`;
+    if (stats.oldest != null) {
+      const ageMin = Math.round((now - stats.oldest) / 60_000);
       queueLine += `, oldest pending ${ageMin}m old`;
     }
     // Warn (not fail) if failed rows exist — the queue is still operational,
     // but the operator should know they're accumulating.
-    const marker = failed.c > 0 ? "•" : "✓";
+    const marker = failed > 0 ? "•" : "✓";
     lines.push(`${marker} ${queueLine}`);
-    if (failed.c > 0) lines.push(`  → run "openclaw notify list --failed" to inspect`);
+    if (failed > 0) lines.push(`  → run "openclaw notify list --failed" to inspect, then "notify retry" or delete`);
 
     // Orphan check: rows pinned to a destination the config no longer
     // defines. Those rows will never deliver until the destination comes
@@ -302,6 +340,21 @@ export async function runDoctor(params: {
   }
 
   return { ok, lines };
+}
+
+// Compact human-readable relative duration — "45s", "8m", "2h", "1h15m".
+// Minutes-granularity past a minute (sub-minute precision isn't useful for a
+// backoff deadline an operator is eyeballing), hours with remainder minutes
+// once it tips past an hour.
+function formatRelativeMs(ms: number): string {
+  if (ms <= 0) return "now";
+  const sec = Math.ceil(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.ceil(sec / 60);
+  if (min < 60) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  const rem = min % 60;
+  return rem === 0 ? `${hr}h` : `${hr}h${rem}m`;
 }
 
 function parseDurationToDays(input: string): number {

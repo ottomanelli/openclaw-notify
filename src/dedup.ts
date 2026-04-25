@@ -41,9 +41,11 @@ export function updateDedupRow(
 ): void {
   // Reset delivery_attempts so a fresh enqueue gets a fresh retry budget;
   // folding into a crash-recovered row shouldn't inherit its attempt count.
+  // Clear next_attempt_at too — a new enqueue with the same key is a signal
+  // that the consumer wants it delivered now, not after the old backoff.
   db.prepare(
     `UPDATE notifications
-     SET raw_data = ?, created_at = ?, delivery_attempts = 0, reserved_at = NULL
+     SET raw_data = ?, created_at = ?, delivery_attempts = 0, reserved_at = NULL, next_attempt_at = NULL
      WHERE id = ?`,
   ).run(rawDataJson, Date.now(), id);
 }

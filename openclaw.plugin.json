@@ -60,5 +60,76 @@
         }
       }
     }
+  },
+  "uiHints": {
+    "tickIntervalSec": {
+      "label": "Tick interval (seconds)",
+      "help": "How often the in-gateway flusher wakes up. Default: 1800 (30 min). Lower bound: 10.",
+      "advanced": true
+    },
+    "destinations": {
+      "label": "Destinations",
+      "help": "Named delivery routes. \"default\" is required. Add others (e.g. \"work\", \"urgent\") and route to them with `notify enqueue --destination <name>`."
+    },
+    "destinations.default": {
+      "label": "Default destination",
+      "help": "Where notifications go when no --destination is specified."
+    },
+    "destinations.default.channel": {
+      "label": "Channel",
+      "help": "telegram | discord | slack | signal | imessage. The channel plugin must already be installed."
+    },
+    "destinations.default.chatId": {
+      "label": "Chat ID",
+      "help": "Channel-specific recipient identifier (Telegram chat id, Slack channel id, etc.)."
+    },
+    "destinations.default.threadId": {
+      "label": "Thread ID",
+      "help": "Optional. Only telegram and slack support threads.",
+      "advanced": true
+    },
+    "quietHours": {
+      "label": "Quiet hours",
+      "help": "Silence routine notifications during a window. `notify send --force` and per-row urgency override."
+    },
+    "quietHours.start": {
+      "label": "Start",
+      "placeholder": "21:00"
+    },
+    "quietHours.end": {
+      "label": "End",
+      "placeholder": "08:00"
+    },
+    "quietHours.tz": {
+      "label": "Timezone (IANA)",
+      "placeholder": "America/New_York"
+    },
+    "llm": {
+      "label": "LLM formatting",
+      "help": "Batched notifications can be rewritten by an LLM into a single human message. Disabled or unreachable LLMs fall back to a plain template."
+    },
+    "llm.enabled": {
+      "label": "Enable LLM formatting"
+    },
+    "llm.provider": {
+      "label": "Provider override",
+      "help": "Force a specific provider. Leave null to auto-pick whichever provider openclaw has credentials for.",
+      "advanced": true
+    },
+    "llm.model": {
+      "label": "Model override",
+      "help": "Force a specific model. Leave null to use a cheap default per provider.",
+      "advanced": true
+    },
+    "personality": {
+      "label": "Personality",
+      "help": "Optional one-liner voice/style for LLM-formatted notifications (e.g. \"Casual but organized.\").",
+      "placeholder": "Casual but organized."
+    },
+    "dedupWindowMin": {
+      "label": "Dedup window (minutes)",
+      "help": "Minutes within which identical (source, dedup_key, destination) rows are suppressed.",
+      "advanced": true
+    }
   }
 }

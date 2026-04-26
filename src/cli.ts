@@ -339,6 +339,26 @@ export async function runDoctor(params: {
     closeDb(db);
   }
 
+  // Surface optional knobs that aren't set so users discover them without
+  // having to read the README. Only emit when at least one tip applies —
+  // a fully-tuned install stays quiet.
+  const tips: string[] = [];
+  if (config.quietHours == null) {
+    tips.push("○ quietHours not set — silence overnight delivery (start, end, tz)");
+  }
+  if (config.personality == null) {
+    tips.push("○ personality not set — voice for LLM-formatted output");
+  }
+  if (Object.keys(config.destinations).length === 1) {
+    tips.push('○ destinations: only "default" — add named routes (e.g. "work", "urgent") for routing');
+  }
+  if (tips.length > 0) {
+    lines.push("");
+    lines.push("Tips (optional):");
+    for (const t of tips) lines.push(t);
+    lines.push("  Set: openclaw config set plugins.notify.config.<path> <value>  (or edit your config file)");
+  }
+
   return { ok, lines };
 }
 

@@ -631,4 +631,34 @@ describe("cli doctor", () => {
     expect(report.ok).toBe(false);
     expect(report.lines.join("\n")).toMatch(/2 unsent row\(s\) bound to unknown destination "family"/);
   });
+
+  it("surfaces unset optional knobs (quietHours, personality) as tips", async () => {
+    const report = await runDoctor(doctorDeps());
+    const out = report.lines.join("\n");
+    expect(out).toMatch(/Tips \(optional\):/);
+    expect(out).toMatch(/quietHours not set/);
+    expect(out).toMatch(/personality not set/);
+    expect(out).toMatch(/openclaw config set plugins\.notify\.config/);
+  });
+
+  it("hints to add named destinations when only 'default' is configured", async () => {
+    const cfg = baseConfig({
+      destinations: { default: { channel: "telegram", chatId: "d1", threadId: null } },
+    });
+    const report = await runDoctor(doctorDeps({ cfg }));
+    expect(report.lines.join("\n")).toMatch(/destinations: only "default"/);
+  });
+
+  it("emits no tips section when every optional knob is set", async () => {
+    const cfg = baseConfig({
+      quietHours: { start: "21:00", end: "08:00", tz: "America/New_York" },
+      personality: "Casual but organized.",
+      // baseConfig already has two destinations (default + work)
+    });
+    const report = await runDoctor(doctorDeps({ cfg }));
+    const out = report.lines.join("\n");
+    expect(out).not.toMatch(/Tips \(optional\):/);
+    expect(out).not.toMatch(/quietHours not set/);
+    expect(out).not.toMatch(/personality not set/);
+  });
 });

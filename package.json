@@ -4,7 +4,7 @@
   "private": false,
   "description": "OpenClaw plugin: shared notifications queue with batched LLM-formatted delivery and multi-destination routing",
   "license": "MIT-0",
-  "author": "Francis Ottomanelli",
+  "author": "Francis Ottomanelli <francis.ottomanelli@gmail.com>",
   "keywords": [
     "openclaw",
     "openclaw-plugin",
@@ -32,13 +32,14 @@
     "./openclaw.plugin.json": "./openclaw.plugin.json"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.12.0"
   },
   "files": ["index.ts", "src/", "openclaw.plugin.json", "README.md", "LICENSE", "CHANGELOG.md"],
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "openclaw": {
     "extensions": ["./index.ts"],
@@ -59,7 +60,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
-    "@types/node": "^20.0.0",
+    "@types/node": "^22.0.0",
     "commander": "^12.0.0",
     "typescript": "^5.4.0",
     "vitest": "^1.6.0"

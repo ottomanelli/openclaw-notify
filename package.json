@@ -34,6 +34,9 @@
   "engines": {
     "node": ">=22.12.0"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": ["index.ts", "src/", "openclaw.plugin.json", "README.md", "LICENSE", "CHANGELOG.md"],
   "scripts": {
     "test": "vitest run",

@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/notify",
+  "name": "@ottomanelli/openclaw-notify",
   "version": "0.1.0",
   "private": false,
   "description": "OpenClaw plugin: shared notifications queue with batched LLM-formatted delivery and multi-destination routing",

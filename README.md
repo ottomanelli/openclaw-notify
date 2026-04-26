@@ -1,4 +1,4 @@
-# @openclaw/notify
+# @ottomanelli/openclaw-notify
 
 Shared notifications queue for OpenClaw with batched LLM-formatted delivery. Consumer skills (todo, calendar, email-digest, …) shell out to a single CLI to enqueue; the plugin batches, formats, and dispatches via your already-configured OpenClaw channels.
 
@@ -10,10 +10,23 @@ Shared notifications queue for OpenClaw with batched LLM-formatted delivery. Con
 - **Quiet hours** — TZ-aware window that accumulates notifications and flushes on the other side.
 - **Dedup** — consumers pass a `--dedup-key`; repeated enqueues within a window update the pending row in place. Dedup is scoped to `(source, dedup_key, destination)`, so `todo` and `calendar` can both use `--dedup-key reminder:1` without colliding. Once a row has been claimed by a tick, further enqueues with the same key insert a new row (safer than mutating a row that's mid-delivery).
 
+## Requirements
+
+- **Node.js** ≥ 22.12 (matches OpenClaw's own minimum).
+- **OpenClaw** ≥ 2026.3.24-beta.2 (declared in `peerDependencies`).
+- **Native module: `better-sqlite3`.** Pre-built binaries cover macOS (x64/arm64), Linux (glibc x64/arm64), and Windows x64 on Node 22. On Alpine/musl, FreeBSD, or 32-bit ARM you'll need a working C++ toolchain (`apk add build-base python3` or equivalent) for `node-gyp` to build from source.
+
 ## Install
 
 ```bash
-openclaw plugins install @openclaw/notify
+openclaw plugins install @ottomanelli/openclaw-notify
+```
+
+Alternative install paths (no npm publish required):
+```bash
+openclaw plugins install ./openclaw-notify          # local checkout
+openclaw plugins install ./openclaw-notify.tgz      # archive
+openclaw plugins install git+https://github.com/ottomanelli/openclaw-notify.git
 ```
 
 ## Configure
@@ -118,7 +131,7 @@ This plugin dispatches through the gateway runtime's channel registry. A channel
 | `signal`   | `sendMessageSignal`   | `(recipient, text, { textMode?: "markdown" \| "plain" }) => Promise<{ messageId }>`                         |
 | `imessage` | `sendMessageIMessage` | `(recipient, text) => Promise<{ messageId }>`                                                               |
 
-The typed shapes are exported from `@openclaw/notify` (`TelegramSendOpts`, `SlackSendOpts`, `SignalSendOpts`) for channel-plugin authors who want to type-check the call site.
+The typed shapes are exported from `@ottomanelli/openclaw-notify` (`TelegramSendOpts`, `SlackSendOpts`, `SignalSendOpts`) for channel-plugin authors who want to type-check the call site.
 
 If a channel listed in your config isn't registered at service-start time, this plugin logs a warning at most once per 10 minutes per destination and leaves rows bound for that destination untouched (they'll flush when the channel plugin comes online — no data loss).
 

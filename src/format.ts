@@ -42,7 +42,7 @@ const LLM_FETCH_TIMEOUT_MS = 30_000;
 
 export const CHEAP_MODELS = {
   anthropic: "claude-haiku-4-5",
-  openai:    "gpt-4o-mini",
+  openai:    "gpt-6-luna",
   google:    "gemini-1.5-flash",
   groq:      "llama-3.1-8b-instant",
   ollama:    "llama3.2:3b",
@@ -261,14 +261,20 @@ export async function callLlm(
       authorization: `Bearer ${resolved.apiKey}`,
       "content-type": "application/json",
     };
+    // OpenAI's newer models (gpt-5.6-luna, gpt-6-luna, ...) answer HTTP 400 to
+    // `max_tokens` and to any temperature but their default. They take
+    // `max_completion_tokens`, as do OpenAI's older chat models. Other
+    // OpenAI-compatible servers (Groq, Ollama) keep the original options.
+    const limits = resolved.provider === "openai"
+      ? { max_completion_tokens: 500 }
+      : { max_tokens: 500, temperature: 0.7 };
     body = {
       model: resolved.model,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      max_tokens: 500,
-      temperature: 0.7,
+      ...limits,
     };
   }
 

@@ -101,7 +101,7 @@ The service runs on an interval inside the OpenClaw gateway. Each tick:
 4. For each destination: partition `should_format=1` (LLM) vs `0` (template); atomically claim the batch, format, deliver.
 5. Stamp `sent_at` on delivered rows; release reservations on failure so the next tick retries.
 
-LLM provider is auto-selected from the first configured provider in `anthropic → openai → google → groq → ollama` that has a key. Cheap model auto-selection: `claude-haiku-4-5`, `gpt-4o-mini`, `gemini-1.5-flash`, `llama-3.1-8b-instant`, `llama3.2:3b`.
+LLM provider is auto-selected from the first configured provider in `anthropic → openai → google → groq → ollama` that has a key. Cheap model auto-selection: `claude-haiku-4-5`, `gpt-6-luna`, `gemini-1.5-flash`, `llama-3.1-8b-instant`, `llama3.2:3b`.
 
 ## Prompt injection
 

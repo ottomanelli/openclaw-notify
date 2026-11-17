@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- LLM formatting with newer OpenAI models (`gpt-5.6-luna`, `gpt-6-luna`, ...), which
+  answered HTTP 400 to `max_tokens` and to a non-default `temperature`. The OpenAI
+  provider now sends `max_completion_tokens` and no temperature. Other
+  OpenAI-compatible providers are unchanged.
+
+### Changed
+
+- The cheap default model for OpenAI is `gpt-6-luna` (was `gpt-4o-mini`).
+
 ## [0.1.0] — 2026-04-26
 
 Initial release.

@@ -450,7 +450,7 @@ describe("formatBatch", () => {
 });
 
 describe("callLlm fetch options", () => {
-  const resolved = { provider: "openai", model: "gpt-4o-mini", apiKey: "k" };
+  const resolved = { provider: "openai", model: "gpt-6-luna", apiKey: "k" };
 
   it("attaches an AbortSignal so a hung provider can't freeze the tick loop", async () => {
     const { callLlm } = await import("../src/format.js");
@@ -465,8 +465,35 @@ describe("callLlm fetch options", () => {
   });
 });
 
+describe("callLlm request options", () => {
+  const sent = async (provider: string, model: string) => {
+    const { callLlm } = await import("../src/format.js");
+    let body: Record<string, unknown> = {};
+    const fetchFn = vi.fn(async (_url: string, opts: RequestInit) => {
+      body = JSON.parse(String(opts.body));
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }] }), text: async () => "" } as unknown as Response;
+    });
+    await callLlm({ provider, model, apiKey: "k" } as never, "sys", "user", fetchFn as never);
+    return body;
+  };
+
+  it("sends OpenAI the options its newer models accept", async () => {
+    const body = await sent("openai", "gpt-6-luna");
+    expect(body.max_completion_tokens).toBe(500);
+    expect(body).not.toHaveProperty("max_tokens");
+    expect(body).not.toHaveProperty("temperature");
+  });
+
+  it("keeps the original options for other OpenAI-compatible providers", async () => {
+    const body = await sent("groq", "llama-3.1-8b-instant");
+    expect(body.max_tokens).toBe(500);
+    expect(body.temperature).toBe(0.7);
+    expect(body).not.toHaveProperty("max_completion_tokens");
+  });
+});
+
 describe("callLlm error scrubbing", () => {
-  const resolved = { provider: "openai", model: "gpt-4o-mini", apiKey: "k" };
+  const resolved = { provider: "openai", model: "gpt-6-luna", apiKey: "k" };
   const fakeResp = (status: number, body: string): Response =>
     ({ ok: false, status, json: async () => ({}), text: async () => body } as unknown as Response);
 

@@ -16,6 +16,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - The cheap default model for OpenAI is `gpt-6-luna` (was `gpt-4o-mini`).
+- `better-sqlite3` ^12, which has builds for Node 24 to 26. With ^11 on Node 24 the
+  plugin could not open its queue, so `notify enqueue` failed and nothing was delivered.
 
 ## [0.1.0] — 2026-04-26
 

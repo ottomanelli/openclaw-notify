@@ -8,6 +8,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The flusher never started on current OpenClaw: a plugin is no longer loaded at Gateway
+  startup unless its manifest says `activation.onStartup: true`. Enqueueing worked (the
+  CLI loads the plugin on demand) but nothing was ever delivered. The manifest now says so.
 - LLM formatting with newer OpenAI models (`gpt-5.6-luna`, `gpt-6-luna`, ...), which
   answered HTTP 400 to `max_tokens` and to a non-default `temperature`. The OpenAI
   provider now sends `max_completion_tokens` and no temperature. Other

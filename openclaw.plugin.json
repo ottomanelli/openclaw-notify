@@ -2,6 +2,9 @@
   "id": "notify",
   "name": "Notify",
   "description": "Shared notifications queue with batched LLM-formatted delivery and multi-destination routing.",
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

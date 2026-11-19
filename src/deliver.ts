@@ -45,6 +45,19 @@ function channelAcceptsPlainMode(channel: ChannelName): boolean {
   return channel === "telegram" || channel === "signal";
 }
 
+// The host's OpenClaw config, which the outbound adapters need with every send. Set
+// once by the plugin entrypoint (api.config).
+let hostConfig: unknown = undefined;
+export function setHostConfig(cfg: unknown): void {
+  hostConfig = cfg;
+}
+
+// The outbound adapters have no "plain text" switch, so the plain retry removes the
+// Markdown marks itself.
+export function stripMarkdown(text: string): string {
+  return text.replace(/[*_`~]/g, "").replace(/^#+\s*/gm, "");
+}
+
 async function sendOne(
   runtime: RuntimeBridge,
   dest: Destination,
@@ -52,6 +65,22 @@ async function sendOne(
   plainText = false,
 ): Promise<{ messageId: string }> {
   const capped = capMessage(dest.channel, message);
+
+  // Current OpenClaw: one adapter per channel, loaded by id.
+  const loadAdapter = runtime.channel.outbound?.loadAdapter;
+  if (typeof loadAdapter === "function") {
+    const adapter = await loadAdapter(dest.channel);
+    if (!adapter?.sendText) throw new Error(`${dest.channel} channel not registered`);
+    const result = await adapter.sendText({
+      cfg: hostConfig,
+      to: dest.chatId,
+      text: plainText ? stripMarkdown(capped) : capped,
+      threadId: dest.threadId ?? undefined,
+    });
+    return { messageId: String(result?.messageId ?? "") };
+  }
+
+  // Older OpenClaw: per-channel send functions.
   const textMode: "markdown" | "plain" = plainText ? "plain" : "markdown";
   switch (dest.channel) {
     case "telegram": {

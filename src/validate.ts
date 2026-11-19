@@ -9,6 +9,18 @@ export const SEND_FN_BY_CHANNEL: Record<ChannelName, string> = {
   imessage: "sendMessageIMessage",
 };
 
+/**
+ * Whether a channel can be sent to. On current OpenClaw the adapter is loaded when a
+ * message is sent, so all that can be said here is that the loader exists; a channel
+ * that turns out to be missing fails at send time and is retried. On older OpenClaw the
+ * per-channel send function is checked directly.
+ */
+export function channelLooksUsable(runtime: RuntimeBridge, channel: ChannelName): boolean {
+  if (typeof runtime.channel.outbound?.loadAdapter === "function") return true;
+  const ns = (runtime.channel as Record<string, unknown>)[channel] as Record<string, unknown> | undefined;
+  return Boolean(ns && typeof ns[SEND_FN_BY_CHANNEL[channel]] === "function");
+}
+
 export function validateDestinations(
   cfg: NotifyConfig,
   runtime: RuntimeBridge,
@@ -16,9 +28,7 @@ export function validateDestinations(
 ): Set<string> {
   const active = new Set<string>();
   for (const [name, dest] of Object.entries(cfg.destinations)) {
-    const fnName = SEND_FN_BY_CHANNEL[dest.channel];
-    const ns = (runtime.channel as Record<string, unknown>)[dest.channel] as Record<string, unknown> | undefined;
-    if (ns && typeof ns[fnName] === "function") {
+    if (channelLooksUsable(runtime, dest.channel)) {
       active.add(name);
     } else {
       logger.warn(`notify: destination "${name}" uses channel "${dest.channel}" which is not registered; rows for it will not be flushed`);

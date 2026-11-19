@@ -8,6 +8,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Sending on current OpenClaw. The per-channel send functions the plugin called
+  (`runtime.channel.telegram.sendMessageTelegram` and its siblings) no longer exist;
+  messages now go through `runtime.channel.outbound.loadAdapter(<channel>)` and the
+  adapter's `sendText`. The old functions are still used when the loader is absent.
 - The flusher never started on current OpenClaw: a plugin is no longer loaded at Gateway
   startup unless its manifest says `activation.onStartup: true`. Enqueueing worked (the
   CLI loads the plugin on demand) but nothing was ever delivered. The manifest now says so.

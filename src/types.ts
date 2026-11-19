@@ -70,11 +70,28 @@ export type SignalSendOpts = {
 
 type SendResult = { messageId: string; chatId?: string };
 
+// Current OpenClaw: every channel is sent through one "outbound adapter", loaded by
+// channel id. Only the fields this plugin passes are typed here.
+export type OutboundSendContext = {
+  /** The host's OpenClaw config (api.config). */
+  cfg: unknown;
+  to: string;
+  text: string;
+  accountId?: string | null;
+  threadId?: string | number | null;
+};
+export type OutboundAdapter = {
+  sendText?: (ctx: OutboundSendContext) => Promise<{ messageId?: string; channel?: string }>;
+};
+
 export type RuntimeBridge = {
   modelAuth: {
     resolveApiKeyForProvider: (params: { provider: string }) => Promise<{ apiKey?: string }>;
   };
   channel: {
+    /** Current OpenClaw. When present it is used for every channel. */
+    outbound?: { loadAdapter: (id: string) => Promise<OutboundAdapter | undefined> };
+    // Older OpenClaw: one send function per channel. Kept as a fallback.
     telegram?: { sendMessageTelegram: (to: string, text: string, opts?: TelegramSendOpts) => Promise<SendResult> };
     discord?:  { sendMessageDiscord:  (to: string, text: string) => Promise<SendResult> };
     slack?:    { sendMessageSlack:    (to: string, text: string, opts?: SlackSendOpts) => Promise<SendResult> };

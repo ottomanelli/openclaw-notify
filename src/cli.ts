@@ -248,11 +248,20 @@ export async function runDoctor(params: {
   lines.push("✓ config: valid");
 
   for (const [name, dest] of Object.entries(config.destinations)) {
-    const fnName = SEND_FN_BY_CHANNEL[dest.channel];
-    const ns = (runtime.channel as Record<string, unknown>)[dest.channel] as
-      | Record<string, unknown>
-      | undefined;
-    if (ns && typeof ns[fnName] === "function") {
+    // Current OpenClaw: ask for the channel's outbound adapter. Older: look for its
+    // send function.
+    let registered: boolean;
+    const loadAdapter = runtime.channel.outbound?.loadAdapter;
+    if (typeof loadAdapter === "function") {
+      registered = Boolean((await loadAdapter(dest.channel).catch(() => undefined))?.sendText);
+    } else {
+      const fnName = SEND_FN_BY_CHANNEL[dest.channel];
+      const ns = (runtime.channel as Record<string, unknown>)[dest.channel] as
+        | Record<string, unknown>
+        | undefined;
+      registered = Boolean(ns && typeof ns[fnName] === "function");
+    }
+    if (registered) {
       lines.push(`✓ destination "${name}": ${dest.channel} channel registered`);
     } else {
       lines.push(`✗ destination "${name}": ${dest.channel} channel NOT registered`);

@@ -10,6 +10,7 @@ import { registerNotifyCli } from "./src/cli.js";
 import { createNotifyService } from "./src/service.js";
 import { tick, type TickLogger, type TickResult } from "./src/tick.js";
 import { validateDestinations } from "./src/validate.js";
+import { setHostConfig } from "./src/deliver.js";
 import type { RuntimeBridge } from "./src/types.js";
 
 export type {
@@ -36,6 +37,8 @@ const notifyPlugin: OpenClawPluginDefinition = {
       error: (m) => api.logger.error(m),
     };
     const runtime = api.runtime as unknown as RuntimeBridge;
+    // The outbound adapters take the host config with every send.
+    setHostConfig(api.config);
 
     // Resolve DB path once at register time. Same path in both the CLI
     // process (shelled out via `openclaw notify enqueue`) and the long-

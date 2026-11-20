@@ -107,10 +107,18 @@ export async function tick(
         const message = batch.useLlm
           ? await formatBatch(runtime, claimed, cfg.llm, cfg.personality, { channel: destCfg.channel, logger })
           : renderTemplate(claimed, destCfg.channel);
-        const deliveryResult = await deliver(runtime, destCfg, message);
+        const deliveryResult = await deliver(runtime, destCfg, message, {
+          destination: destName,
+          sources: [...new Set(claimed.map((row) => row.source))],
+          categories: [...new Set(claimed.map((row) => row.category).filter((c): c is string => Boolean(c)))],
+          count: claimed.length,
+        });
         if (deliveryResult.ok) {
           markSent(db, claimedIds);
           result.delivered += claimedIds.length;
+          for (const problem of deliveryResult.webhookErrors ?? []) {
+            logger.warn(`notify: "${destName}" was delivered, but ${problem}`);
+          }
         } else {
           const { retried, failed } = releaseRows(db, claimedIds);
           result.failedTransient += retried.length;

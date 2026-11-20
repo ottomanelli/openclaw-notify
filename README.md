@@ -6,6 +6,7 @@ Shared notifications queue for OpenClaw with batched LLM-formatted delivery. Con
 
 - **One queue for all skills** — reminders from todo and events from calendar collapse into a single natural-language message.
 - **Multi-destination routing** — route `--destination work` to Slack and the rest to Telegram (or iMessage / Discord / Signal).
+- **Webhooks** — send each delivered message to your own service as well as, or instead of, a chat: a phone push relay, a display, an automation. See [Where notifications go](#where-notifications-go).
 - **LLM formatting via your OpenClaw keys** — no per-skill API keys. Cheap model auto-selected per provider.
 - **Quiet hours** — TZ-aware window that accumulates notifications and flushes on the other side.
 - **Dedup** — consumers pass a `--dedup-key`; repeated enqueues within a window update the pending row in place. Dedup is scoped to `(source, dedup_key, destination)`, so `todo` and `calendar` can both use `--dedup-key reminder:1` without colliding. Once a row has been claimed by a tick, further enqueues with the same key insert a new row (safer than mutating a row that's mid-delivery).
@@ -49,6 +50,86 @@ Under `plugins.notify` in your OpenClaw config:
 ```
 
 `destinations.default` is required. Add as many named destinations as you want. Valid channel values: `telegram | discord | slack | signal | imessage` — each must correspond to a channel plugin you have registered in OpenClaw.
+
+
+### Where notifications go
+
+Each named destination can deliver to a chat, to one or more web addresses (webhooks),
+or to both. Whatever queues a notification names the destination it wants; `default` is
+used when it names none.
+
+**A chat only.** This is how the plugin has always worked.
+
+```json
+"destinations": {
+  "default": { "channel": "telegram", "chatId": "123456789" }
+}
+```
+
+**A chat and a service of your own.** The chat is delivered first; the webhooks are then
+told as well.
+
+```json
+"destinations": {
+  "default": {
+    "channel": "telegram",
+    "chatId": "123456789",
+    "webhooks": [
+      { "url": "https://example.com/notify", "headers": { "Authorization": "Bearer <token>" } }
+    ]
+  }
+}
+```
+
+**Only a service of your own.** Leave `chatId` out. `channel` is then optional and only
+picks the message style (Telegram's by default).
+
+```json
+"destinations": {
+  "default": { "webhooks": [{ "url": "https://example.com/notify" }] },
+  "urgent":  { "channel": "slack", "chatId": "C0123456789" }
+}
+```
+
+A webhook can be anything that accepts an HTTP POST: a push relay for a phone app, a
+home display, an automation service. `headers` is optional and is sent with every
+request; put credentials there. They live in your OpenClaw config, never in this plugin.
+
+#### What a webhook receives
+
+One `POST` per delivered batch, with `Content-Type: application/json`:
+
+```json
+{
+  "text": "*Reminder:* pay the water bill by Friday",
+  "plain": "Reminder: pay the water bill by Friday",
+  "destination": "default",
+  "sources": ["todo"],
+  "categories": ["reminder"],
+  "count": 1
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `text` | The message as delivered to a chat. It may contain Markdown |
+| `plain` | The same with Markdown marks removed, for places that show plain text |
+| `destination` | The name of the destination it was queued for |
+| `sources`, `categories` | The distinct sources and categories of the notifications in this batch |
+| `count` | How many queued notifications the message covers |
+
+It is sent after batching, formatting and quiet hours, so a webhook gets exactly what a
+chat would. Answer with any 2xx status within 15 seconds; anything else counts as a failure.
+
+#### Success, failure and retries
+
+| Destination has | What counts as delivered | If a webhook fails |
+|---|---|---|
+| A chat only | The chat accepted it | (none) |
+| A chat and webhooks | The chat accepted it | Logged as a warning. The notification stays delivered and is not retried, so the chat never gets it twice |
+| Webhooks only | Every webhook answered 2xx | The whole batch is retried later, with the same backoff as a failed chat. A webhook that already answered will be called again, so make yours tolerate a repeat |
+
+If the chat itself fails, the webhooks are not called, and the batch is retried as a whole.
 
 ## CLI
 

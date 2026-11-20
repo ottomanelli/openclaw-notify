@@ -1,4 +1,4 @@
-import type { NotifyConfig, ChannelName, Destination } from "./types.js";
+import type { NotifyConfig, ChannelName, Destination, WebhookTarget } from "./types.js";
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -32,18 +32,63 @@ const MAX_PERSONALITY_LEN = 2048;
 // anything below this is abusive to LLM/channel APIs.
 const MIN_TICK_INTERVAL_SEC = 10;
 
+function parseWebhooks(name: string, raw: unknown): WebhookTarget[] {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) {
+    throw new ConfigError(`destinations.${name}.webhooks: must be a list`);
+  }
+  return raw.map((entry, i) => {
+    const where = `destinations.${name}.webhooks[${i}]`;
+    if (!entry || typeof entry !== "object") throw new ConfigError(`${where}: must be an object`);
+    const e = entry as Record<string, unknown>;
+    let parsed: URL;
+    try {
+      parsed = new URL(String(e.url ?? ""));
+    } catch {
+      throw new ConfigError(`${where}.url: must be an http(s) address`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new ConfigError(`${where}.url: must be an http(s) address`);
+    }
+    const headers: Record<string, string> = {};
+    if (e.headers != null) {
+      if (typeof e.headers !== "object" || Array.isArray(e.headers)) {
+        throw new ConfigError(`${where}.headers: must be an object of strings`);
+      }
+      for (const [key, value] of Object.entries(e.headers as Record<string, unknown>)) {
+        if (typeof value !== "string") throw new ConfigError(`${where}.headers.${key}: must be a string`);
+        headers[key] = value;
+      }
+    }
+    return { url: parsed.toString(), headers };
+  });
+}
+
 function parseDestination(name: string, raw: unknown): Destination {
   if (!raw || typeof raw !== "object") {
     throw new ConfigError(`destinations.${name}: must be an object`);
   }
   const o = raw as Record<string, unknown>;
+  const webhooks = parseWebhooks(name, o.webhooks);
+  // Webhooks alone are enough: no chat is needed then. `channel` may still be given to
+  // choose the message style (it defaults to telegram's).
+  if (webhooks.length > 0 && (o.chatId == null || o.chatId === "")) {
+    const style = o.channel == null ? "telegram" : o.channel;
+    if (typeof style !== "string" || !VALID_CHANNELS.has(style as ChannelName)) {
+      throw new ConfigError(`destinations.${name}.channel: must be one of ${[...VALID_CHANNELS].join(", ")}`);
+    }
+    if (o.threadId != null) {
+      throw new ConfigError(`destinations.${name}.threadId: needs a chatId`);
+    }
+    return { channel: style as ChannelName, chatId: null, threadId: null, webhooks };
+  }
   const channel = o.channel;
   const chatId = o.chatId;
   if (typeof channel !== "string" || !VALID_CHANNELS.has(channel as ChannelName)) {
     throw new ConfigError(`destinations.${name}.channel: must be one of ${[...VALID_CHANNELS].join(", ")}`);
   }
   if (typeof chatId !== "string" || chatId.length === 0) {
-    throw new ConfigError(`destinations.${name}.chatId: required non-empty string`);
+    throw new ConfigError(`destinations.${name}.chatId: required non-empty string (or give webhooks)`);
   }
   const threadId = o.threadId;
   if (threadId != null && typeof threadId !== "string" && typeof threadId !== "number") {
@@ -61,7 +106,12 @@ function parseDestination(name: string, raw: unknown): Destination {
       throw new ConfigError(`destinations.${name}.threadId: telegram thread IDs must be integers (got "${threadId}")`);
     }
   }
-  return { channel: channel as ChannelName, chatId, threadId: (threadId ?? null) as string | number | null };
+  return {
+    channel: channel as ChannelName,
+    chatId,
+    threadId: (threadId ?? null) as string | number | null,
+    ...(webhooks.length > 0 ? { webhooks } : {}),
+  };
 }
 
 function isFiniteNumber(v: unknown): v is number {

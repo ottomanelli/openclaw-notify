@@ -6,6 +6,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Webhook destinations.** A destination may list `webhooks` (`[{ "url": "...", "headers": {...} }]`). Each
+  delivered message is also POSTed there as JSON: `{ text, plain, destination, sources, categories, count }`
+  (`plain` is `text` without Markdown marks). With a `chatId`, the chat decides success and webhooks are
+  best-effort (a failure is logged, the rows stay sent, so the chat is not messaged twice). With webhooks and
+  no `chatId`, the webhooks are the delivery: all must answer 2xx or the batch is retried. Existing
+  chat-only destinations are unchanged.
+
 ### Fixed
 
 - Sending on current OpenClaw. The per-channel send functions the plugin called

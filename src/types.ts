@@ -1,9 +1,21 @@
 export type ChannelName = "telegram" | "discord" | "slack" | "signal" | "imessage";
 
+// A web address that receives each delivered message as JSON (see deliver.ts), so a
+// notification can reach something that is not a chat: a phone app's push relay, a
+// display, another service.
+export type WebhookTarget = {
+  url: string;
+  headers: Record<string, string>;
+};
+
+// Where a named destination delivers. A chat, a list of webhooks, or both. With a chat,
+// the chat is what decides success and the webhooks are best-effort; with webhooks
+// only, they decide. `channel` also picks the message style when there is no chat.
 export type Destination = {
   channel: ChannelName;
-  chatId: string;
+  chatId: string | null;
   threadId: string | number | null;
+  webhooks?: WebhookTarget[];
 };
 
 export type QuietHoursConfig = {
@@ -50,8 +62,16 @@ export type ParsedRawData = {
 };
 
 export type DeliveryResult =
-  | { ok: true; messageId?: string }
+  | { ok: true; messageId?: string; webhookErrors?: string[] }
   | { ok: false; error: string };
+
+// What a webhook is told about the message besides its text.
+export type DeliveryMeta = {
+  destination?: string;
+  sources?: string[];
+  categories?: string[];
+  count?: number;
+};
 
 // Channel-specific opts shapes. These document the exact keys deliver.ts
 // passes to each channel plugin; if a channel plugin renames keys, markdown

@@ -19,10 +19,22 @@ describe("resolveConfig", () => {
     );
   });
 
-  it("throws on unknown channel", () => {
-    expect(() =>
-      resolveConfig({ destinations: { default: { channel: "fax", chatId: "c" } } }),
-    ).toThrow(/channel/);
+  it("accepts another installed channel's id (one this plugin has no details of)", () => {
+    const cfg = resolveConfig({ destinations: { default: { channel: "pushapp", chatId: "phone" } } });
+    expect(cfg.destinations.default).toEqual({ channel: "pushapp", chatId: "phone", threadId: null });
+  });
+
+  it("hands a threadId to a channel it has no details of", () => {
+    const cfg = resolveConfig({ destinations: { default: { channel: "matrix", chatId: "!room", threadId: "$event" } } });
+    expect(cfg.destinations.default.threadId).toBe("$event");
+  });
+
+  it("throws on a channel that is not an id", () => {
+    for (const channel of ["", "Fax Machine", "-dash", "x".repeat(80), 7, null]) {
+      expect(() =>
+        resolveConfig({ destinations: { default: { channel, chatId: "c" } } }),
+      ).toThrow(/channel: must be an OpenClaw channel id/);
+    }
   });
 
   it("preserves quietHours when supplied", () => {

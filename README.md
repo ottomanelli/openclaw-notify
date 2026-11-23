@@ -49,7 +49,7 @@ Under `plugins.notify` in your OpenClaw config:
 }
 ```
 
-`destinations.default` is required. Add as many named destinations as you want. Valid channel values: `telegram | discord | slack | signal | imessage` — each must correspond to a channel plugin you have registered in OpenClaw.
+`destinations.default` is required. Add as many named destinations as you want. `channel` is an OpenClaw channel id: `telegram`, `discord`, `slack`, `signal`, `imessage`, or the id of any other channel you have installed (a channel plugin of your own, say). For the five named here the plugin knows the message length limit and Markdown style. Any other channel is sent plain text, cut to the length its adapter reports (4000 characters if it reports none), and is handed `threadId` as given.
 
 
 ### Where notifications go
@@ -151,6 +151,7 @@ Add `--destination work` to route to a named destination. Add `--no-format` to s
 openclaw notify send              # flush now (respects quiet hours)
 openclaw notify send --force      # bypass quiet hours
 openclaw notify send --destination work
+openclaw notify send --source calendar --category day_reminders   # only that producer's rows
 openclaw notify list              # print pending rows as JSON
 openclaw notify list --failed     # only rows that exceeded the retry budget
 openclaw notify list --all        # include sent and failed rows
@@ -159,7 +160,29 @@ openclaw notify retry --id 42     # reset one failed row so the next tick re-del
 openclaw notify retry --all       # reset every failed row
 openclaw notify doctor            # probe config, destinations, LLM, and queue
 openclaw notify doctor --skip-llm # skip the live LLM API probe
+openclaw notify send --local      # flush in this process, without asking the Gateway
+openclaw notify doctor --local    # check from this process, without asking the Gateway
 ```
+
+#### `send` and `doctor` are done by the running Gateway
+
+`openclaw notify send` typed in a terminal, or run by a script or a scheduled job, is a
+short-lived process. OpenClaw loads neither the channel plugins nor the model keys into
+it, so from there no chat can be reached and nothing can be LLM-formatted. The running
+Gateway has both. So `send` asks the Gateway to do the flush (Gateway method
+`notify.flush`) and prints the counts it answers with, and `doctor` asks it for its
+report (`notify.doctor`), which is the view that matters since that is where messages
+are sent from. A job that enqueues a message and wants it out now can therefore just
+run `notify send`, whatever channel the destination names.
+
+If no Gateway is running (or it runs a version of this plugin from before these
+methods, or your OpenClaw has no Gateway client for plugins), the command says so on
+stderr and works in its own process. Destinations made of webhooks are delivered from
+there; rows that want LLM formatting may fail and be retried later, since the model
+keys are usually not readable from a CLI process. Rows for a chat are left pending,
+untouched, for the Gateway to send when it is back (`left 2 pending ...`). `--local` asks for that behaviour outright. If the
+Gateway takes the request but does not answer in time, the command fails rather than
+flush a second time; check `notify list`.
 
 `notify send` prints a one-line summary so callers can see what happened:
 
@@ -168,6 +191,7 @@ delivered 3, failed 1 (will retry)
 skipped: quiet hours (pass --force to override)
 no pending rows
 no pending rows (2 backing off, next in 8m)
+delivered 1, left 2 pending (their destination cannot be used from here; see the log)
 ```
 
 `notify doctor` exits non-zero when anything is unhealthy (a destination channel isn't registered, the configured LLM provider has no key, the live LLM probe fails, etc.), so it composes cleanly with shell scripts, CI checks, and systemd `ExecStartPre=`.
@@ -202,7 +226,15 @@ Delivery is **at-least-once**. Duplicates are rare but possible (see the duplica
 
 ## Channel plugin contract
 
-This plugin dispatches through the gateway runtime's channel registry. A channel plugin must expose the exact method name and opts shape below on `runtime.channel.<name>`:
+On current OpenClaw every channel is sent through its outbound adapter:
+`runtime.channel.outbound.loadAdapter(<channel id>)`, then
+`adapter.sendText({ cfg, to, text, threadId })`. Any installed channel works, including
+one this plugin has never heard of; it only needs `outbound.sendText` (and may give
+`textChunkLimit`).
+
+On older OpenClaw, which has no adapter loader, the plugin falls back to per-channel
+send functions, for these five channels only. A channel plugin must then expose the
+exact method name and opts shape below on `runtime.channel.<name>`:
 
 | Channel    | Method                | Call shape                                                                                                  |
 |------------|-----------------------|-------------------------------------------------------------------------------------------------------------|

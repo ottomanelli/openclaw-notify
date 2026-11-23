@@ -1,4 +1,10 @@
-export type ChannelName = "telegram" | "discord" | "slack" | "signal" | "imessage";
+// The channels this plugin knows the details of (message length, Markdown style, threads).
+export type KnownChannel = "telegram" | "discord" | "slack" | "signal" | "imessage";
+
+// Any OpenClaw channel id. One that is not a KnownChannel is sent through its outbound
+// adapter like the rest, in plain text (see format.ts and deliver.ts), so a channel
+// installed as a plugin works without this plugin hearing of it first.
+export type ChannelName = KnownChannel | (string & {});
 
 // A web address that receives each delivered message as JSON (see deliver.ts), so a
 // notification can reach something that is not a chat: a phone app's push relay, a
@@ -101,6 +107,8 @@ export type OutboundSendContext = {
   threadId?: string | number | null;
 };
 export type OutboundAdapter = {
+  /** The longest text the channel takes in one message, when it says. */
+  textChunkLimit?: number;
   sendText?: (ctx: OutboundSendContext) => Promise<{ messageId?: string; channel?: string }>;
 };
 

@@ -1,10 +1,10 @@
 import crypto from "node:crypto";
-import type { ChannelName, LlmConfig, QueueRow, ParsedRawData, RuntimeBridge } from "./types.js";
+import type { ChannelName, KnownChannel, LlmConfig, QueueRow, ParsedRawData, RuntimeBridge } from "./types.js";
 
 // Per-channel markdown hint so the LLM emits syntax the destination actually
 // renders. Telegram/Slack/Signal treat *single asterisks* as bold; Discord
 // needs **double**; iMessage renders nothing.
-const MARKDOWN_STYLE_BY_CHANNEL: Record<ChannelName, string> = {
+const MARKDOWN_STYLE_BY_CHANNEL: Record<KnownChannel, string> = {
   telegram: "Use Telegram Markdown: *bold*, _italic_. No headers, no bullet lists — write it like a friendly text message.",
   slack:    "Use Slack mrkdwn: *bold*, _italic_. No headers, no bullet lists — write it like a friendly text message.",
   discord:  "Use Discord Markdown: **bold**, *italic*. No headers, no bullet lists — write it like a friendly text message.",
@@ -14,6 +14,15 @@ const MARKDOWN_STYLE_BY_CHANNEL: Record<ChannelName, string> = {
 
 const DEFAULT_MARKDOWN_HINT =
   "Use the host platform's Markdown (*bold*, _italic_). No headers, no bullet lists — write it like a friendly text message.";
+
+// A channel this plugin does not know (one installed as a plugin: a phone app's push
+// channel, say). What it renders is unknown, and stray marks read badly as plain text,
+// so it gets plain text.
+const PLAIN_TEXT_HINT = MARKDOWN_STYLE_BY_CHANNEL.imessage;
+
+function isKnownChannel(channel: ChannelName): channel is KnownChannel {
+  return Object.prototype.hasOwnProperty.call(MARKDOWN_STYLE_BY_CHANNEL, channel);
+}
 
 // Strip markdown metacharacters from identifiers we wrap as bold in the
 // template fallback. Source is a producer id ("todo", "calendar") — it
@@ -28,7 +37,7 @@ function stripMarkdownMeta(s: string): string {
 // Bold-wrapping convention per channel for the template fallback path.
 // telegram/slack/signal render *x* as bold; discord needs **x**; imessage
 // renders both literally, so leave the source unadorned.
-const BOLD_STYLE_BY_CHANNEL: Record<ChannelName, (s: string) => string> = {
+const BOLD_STYLE_BY_CHANNEL: Record<KnownChannel, (s: string) => string> = {
   telegram: (s) => `*${stripMarkdownMeta(s)}*`,
   slack:    (s) => `*${stripMarkdownMeta(s)}*`,
   signal:   (s) => `*${stripMarkdownMeta(s)}*`,
@@ -122,7 +131,9 @@ function parseRaw(row: QueueRow): ParsedRawData {
 }
 
 export function renderTemplate(rows: QueueRow[], channel: ChannelName | null = null): string {
-  const bold = channel ? BOLD_STYLE_BY_CHANNEL[channel] : BOLD_STYLE_BY_CHANNEL.telegram;
+  const bold = !channel
+    ? BOLD_STYLE_BY_CHANNEL.telegram
+    : isKnownChannel(channel) ? BOLD_STYLE_BY_CHANNEL[channel] : BOLD_STYLE_BY_CHANNEL.imessage;
   return rows
     .map((r) => {
       const data = parseRaw(r);
@@ -147,7 +158,9 @@ export function buildLlmPrompt(
 ): { systemPrompt: string; userPrompt: string; tag: string } {
   const openFence = `<<<DATA:${tag}`;
   const closeFence = `${tag}:END>>>`;
-  const markdownHint = channel ? MARKDOWN_STYLE_BY_CHANNEL[channel] : DEFAULT_MARKDOWN_HINT;
+  const markdownHint = !channel
+    ? DEFAULT_MARKDOWN_HINT
+    : isKnownChannel(channel) ? MARKDOWN_STYLE_BY_CHANNEL[channel] : PLAIN_TEXT_HINT;
 
   const systemPrompt = [
     "You format pending notification reminders into a single conversational message for Telegram/Slack/etc.",

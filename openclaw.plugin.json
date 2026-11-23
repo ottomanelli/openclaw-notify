@@ -106,13 +106,8 @@
         "properties": {
           "channel": {
             "type": "string",
-            "enum": [
-              "telegram",
-              "discord",
-              "slack",
-              "signal",
-              "imessage"
-            ]
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "description": "An OpenClaw channel id: telegram, discord, slack, signal, imessage, or any other installed channel's id."
           },
           "chatId": {
             "type": [

@@ -107,6 +107,11 @@ describe("renderTemplate", () => {
   it("uses plain text on imessage (no bold markers)", () => {
     const rows = [row({ source: "todo", raw_data: JSON.stringify({ text: "Buy beans" }) })];
     expect(renderTemplate(rows, "imessage")).toBe("todo — Buy beans");
+    // A channel installed as a plugin (a phone app's push channel, say): what it
+    // renders is unknown, so no marks.
+    expect(renderTemplate(rows, "pushapp")).toBe("todo — Buy beans");
+    expect(buildLlmPrompt(rows, null, "TAG", "pushapp").systemPrompt).toMatch(/Plain text only/);
+    expect(buildLlmPrompt(rows, null, "TAG", "telegram").systemPrompt).toMatch(/Telegram Markdown/);
   });
 
   it("keeps single asterisks on slack/signal", () => {

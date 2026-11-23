@@ -4,7 +4,8 @@ import { openDb, closeDb } from "./db.js";
 import { enqueue, purge, retryFailed } from "./queue.js";
 import type { TickResult } from "./tick.js";
 import { callLlm, selectProviderAndModel } from "./format.js";
-import { SEND_FN_BY_CHANNEL } from "./validate.js";
+import { destinationUsableHere } from "./validate.js";
+import type { DoctorReport, FlushRequest, GatewayAnswer } from "./gateway.js";
 
 // Caps exist so a rogue consumer can't fill the index with megabyte keys.
 const MAX_SOURCE_LEN = 64;
@@ -30,8 +31,19 @@ export type CliDeps = {
   program: Command;
   dbPath: string;
   config: NotifyConfig;
-  tickFn: (opts: { force: boolean; onlyDestination?: string }) => Promise<TickResult | void>;
+  tickFn: (opts: SendOptions) => Promise<TickResult | void>;
   runtime: RuntimeBridge;
+  // Asks the running Gateway to do it (see gateway.ts). Left out: everything happens in
+  // this process, where chats and model keys are usually not available.
+  flushRemote?: (request: FlushRequest) => Promise<GatewayAnswer<TickResult | undefined>>;
+  doctorRemote?: (request: { skipLlm: boolean }) => Promise<GatewayAnswer<DoctorReport>>;
+};
+
+export type SendOptions = {
+  force: boolean;
+  onlyDestination?: string;
+  onlySource?: string;
+  onlyCategory?: string;
 };
 
 export function registerNotifyCli(deps: CliDeps): void {
@@ -101,11 +113,29 @@ export function registerNotifyCli(deps: CliDeps): void {
     .description("Flush pending notifications now (respects quiet hours unless --force)")
     .option("--force", "Bypass quiet-hours check", false)
     .option("--destination <name>", "Limit to a single destination")
-    .action(async (opts: { force: boolean; destination?: string }) => {
+    .option("--source <name>", "Only rows from this producer (e.g. calendar)")
+    .option("--category <name>", "Only rows of this subtype (e.g. reminder)")
+    .option("--local", "Flush in this process instead of asking the running Gateway (webhooks only, no LLM)", false)
+    .action(async (opts: { force: boolean; destination?: string; source?: string; category?: string; local?: boolean }) => {
       if (opts.destination && !(opts.destination in config.destinations)) {
         throw new Error(`Unknown --destination "${opts.destination}"`);
       }
-      const r = await deps.tickFn({ force: !!opts.force, onlyDestination: opts.destination });
+      checkLen("source", opts.source, MAX_SOURCE_LEN);
+      checkLen("category", opts.category, MAX_CATEGORY_LEN);
+      const request: FlushRequest = { force: !!opts.force };
+      if (opts.destination) request.onlyDestination = opts.destination;
+      if (opts.source) request.onlySource = opts.source;
+      if (opts.category) request.onlyCategory = opts.category;
+      // The running Gateway does the flush when there is one: it can reach every
+      // installed channel and has the model keys. This process usually has neither.
+      let r: TickResult | void;
+      const remote = !opts.local && deps.flushRemote ? await deps.flushRemote(request) : null;
+      if (remote?.answered) {
+        r = remote.value;
+      } else {
+        if (remote) console.error(`notify: flushing in this process (${remote.why})`);
+        r = await deps.tickFn(request);
+      }
       // If the plugin entrypoint short-circuited (e.g. destinations failed to
       // validate), we get void — print something so `notify send` is never
       // silent.
@@ -124,13 +154,26 @@ export function registerNotifyCli(deps: CliDeps): void {
         const db = openDb(dbPath);
         try {
           const now = Date.now();
+          // Count only the rows this send was limited to.
+          const where = ["sent_at IS NULL", "failed_at IS NULL", "next_attempt_at > ?"];
+          const params: (string | number)[] = [now];
+          for (const [column, value] of [
+            ["destination", opts.destination],
+            ["source", opts.source],
+            ["category", opts.category],
+          ] as const) {
+            if (value) {
+              where.push(`${column} = ?`);
+              params.push(value);
+            }
+          }
           const row = db
             .prepare(
               `SELECT COUNT(*) AS c, MIN(next_attempt_at) AS nextAt
                FROM notifications
-               WHERE sent_at IS NULL AND failed_at IS NULL AND next_attempt_at > ?`,
+               WHERE ${where.join(" AND ")}`,
             )
-            .get(now) as { c: number; nextAt: number | null };
+            .get(...params) as { c: number; nextAt: number | null };
           if (row.c > 0 && row.nextAt != null) {
             console.log(`no pending rows (${row.c} backing off, next in ${formatRelativeMs(row.nextAt - now)})`);
           } else {
@@ -143,6 +186,7 @@ export function registerNotifyCli(deps: CliDeps): void {
         const parts = [`delivered ${r.delivered}`];
         if (r.failedTransient > 0) parts.push(`failed ${r.failedTransient} (will retry)`);
         if (r.failedTerminal > 0) parts.push(`failed ${r.failedTerminal} (exceeded retry budget)`);
+        if (r.leftUnsent) parts.push(`left ${r.leftUnsent} pending (their destination cannot be used from here; see the log)`);
         console.log(parts.join(", "));
       }
     });
@@ -216,21 +260,36 @@ export function registerNotifyCli(deps: CliDeps): void {
     .command("doctor")
     .description("Probe config, destinations, LLM provider, and queue health")
     .option("--skip-llm", "Skip the live LLM probe (no API call)", false)
-    .action(async (opts: { skipLlm?: boolean }) => {
-      const report = await runDoctor({
-        dbPath,
-        config: deps.config,
-        runtime: deps.runtime,
-        skipLlm: !!opts.skipLlm,
-      });
+    .option("--local", "Check from this process instead of asking the running Gateway", false)
+    .action(async (opts: { skipLlm?: boolean; local?: boolean }) => {
+      // Asked of the running Gateway when there is one: that is where messages are
+      // sent from, so it is its view of the channels and model keys that counts.
+      const remote = !opts.local && deps.doctorRemote
+        ? await deps.doctorRemote({ skipLlm: !!opts.skipLlm })
+        : null;
+      let report: DoctorReport;
+      if (remote?.answered) {
+        report = { ok: remote.value.ok, lines: ["Checked in the running Gateway.", ...remote.value.lines] };
+      } else {
+        report = await runDoctor({
+          dbPath,
+          config: deps.config,
+          runtime: deps.runtime,
+          skipLlm: !!opts.skipLlm,
+        });
+        const why = opts.local ? "--local" : remote ? remote.why : null;
+        if (why) {
+          report.lines.unshift(
+            `Checked from this process (${why}). Chats and model keys are usually only available in the running Gateway.`,
+          );
+        }
+      }
       for (const line of report.lines) console.log(line);
       // Non-zero exit when something is unhealthy so `notify doctor` composes
       // with shell scripts, CI, and systemd `ExecStartPre=`.
       if (!report.ok) process.exitCode = 1;
     });
 }
-
-type DoctorReport = { ok: boolean; lines: string[] };
 
 // Extracted so tests can call it without going through commander and stdout.
 export async function runDoctor(params: {
@@ -248,19 +307,15 @@ export async function runDoctor(params: {
   lines.push("✓ config: valid");
 
   for (const [name, dest] of Object.entries(config.destinations)) {
+    // Webhooks and no chat: there is no channel to look for.
+    if (dest.chatId == null) {
+      const count = dest.webhooks?.length ?? 0;
+      lines.push(`✓ destination "${name}": ${count} webhook${count === 1 ? "" : "s"}, no chat`);
+      continue;
+    }
     // Current OpenClaw: ask for the channel's outbound adapter. Older: look for its
     // send function.
-    let registered: boolean;
-    const loadAdapter = runtime.channel.outbound?.loadAdapter;
-    if (typeof loadAdapter === "function") {
-      registered = Boolean((await loadAdapter(dest.channel).catch(() => undefined))?.sendText);
-    } else {
-      const fnName = SEND_FN_BY_CHANNEL[dest.channel];
-      const ns = (runtime.channel as Record<string, unknown>)[dest.channel] as
-        | Record<string, unknown>
-        | undefined;
-      registered = Boolean(ns && typeof ns[fnName] === "function");
-    }
+    const registered = await destinationUsableHere(runtime, dest);
     if (registered) {
       lines.push(`✓ destination "${name}": ${dest.channel} channel registered`);
     } else {
@@ -274,8 +329,19 @@ export async function runDoctor(params: {
   } else if (skipLlm) {
     lines.push("- llm: probe skipped (--skip-llm)");
   } else {
-    const resolved = await selectProviderAndModel(runtime, config.llm);
-    if (!resolved) {
+    // Looking up a key can throw outright in a plain CLI process, which has no access
+    // to the Gateway's credential store.
+    let resolved: Awaited<ReturnType<typeof selectProviderAndModel>> = null;
+    let lookupError: string | null = null;
+    try {
+      resolved = await selectProviderAndModel(runtime, config.llm);
+    } catch (err) {
+      lookupError = (err instanceof Error ? err.message : String(err)).split("\n", 1)[0];
+    }
+    if (lookupError) {
+      lines.push(`✗ llm: model keys cannot be read from this process — ${lookupError}`);
+      ok = false;
+    } else if (!resolved) {
       lines.push("✗ llm: no provider has an API key — batches will use template fallback");
       ok = false;
     } else {

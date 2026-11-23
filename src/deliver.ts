@@ -1,11 +1,11 @@
-import type { ChannelName, Destination, DeliveryResult, RuntimeBridge, TelegramSendOpts, SlackSendOpts, SignalSendOpts, WebhookTarget, DeliveryMeta } from "./types.js";
+import type { ChannelName, KnownChannel, Destination, DeliveryResult, RuntimeBridge, TelegramSendOpts, SlackSendOpts, SignalSendOpts, WebhookTarget, DeliveryMeta } from "./types.js";
 
 // Per-channel hard ceilings on message length. The LLM is configured for
 // max_tokens=500 so it rarely approaches these, but a malformed or verbose
 // output shouldn't reach a channel that will reject it outright. Truncate
 // with ellipsis as a last-resort guard. Values track published per-channel
 // limits with a small safety margin.
-const CHANNEL_MAX_MESSAGE_LEN: Record<ChannelName, number> = {
+const CHANNEL_MAX_MESSAGE_LEN: Record<KnownChannel, number> = {
   telegram: 4000,    // published: 4096
   slack:    39000,   // published: 40000
   discord:  1990,    // published: 2000
@@ -13,8 +13,12 @@ const CHANNEL_MAX_MESSAGE_LEN: Record<ChannelName, number> = {
   imessage: 4000,    // effectively unbounded; keep it reasonable
 };
 
-function capMessage(channel: ChannelName, message: string): string {
-  const max = CHANNEL_MAX_MESSAGE_LEN[channel];
+// For a channel not listed above: what its adapter says it takes, else this.
+const DEFAULT_MAX_MESSAGE_LEN = 4000;
+
+function capMessage(channel: ChannelName, message: string, adapterLimit?: number): string {
+  const known = (CHANNEL_MAX_MESSAGE_LEN as Record<string, number | undefined>)[channel];
+  const max = known ?? (adapterLimit && adapterLimit > 1 ? adapterLimit : DEFAULT_MAX_MESSAGE_LEN);
   if (message.length <= max) return message;
   return message.slice(0, max - 1) + "…";
 }
@@ -56,13 +60,12 @@ async function sendOne(
   message: string,
   plainText = false,
 ): Promise<{ messageId: string }> {
-  const capped = capMessage(dest.channel, message);
-
-  // Current OpenClaw: one adapter per channel, loaded by id.
+  // Current OpenClaw: one adapter per channel, loaded by id. Any installed channel works.
   const loadAdapter = runtime.channel.outbound?.loadAdapter;
   if (typeof loadAdapter === "function") {
     const adapter = await loadAdapter(dest.channel);
     if (!adapter?.sendText) throw new Error(`${dest.channel} channel not registered`);
+    const capped = capMessage(dest.channel, message, adapter.textChunkLimit);
     const result = await adapter.sendText({
       cfg: hostConfig,
       to: dest.chatId as string,
@@ -72,9 +75,10 @@ async function sendOne(
     return { messageId: String(result?.messageId ?? "") };
   }
 
-  // Older OpenClaw: per-channel send functions.
+  // Older OpenClaw: per-channel send functions, for the five channels it had them for.
+  const capped = capMessage(dest.channel, message);
   const textMode: "markdown" | "plain" = plainText ? "plain" : "markdown";
-  switch (dest.channel) {
+  switch (dest.channel as KnownChannel) {
     case "telegram": {
       const ns = runtime.channel.telegram;
       if (!ns?.sendMessageTelegram) throw new Error("telegram channel not registered");
@@ -105,6 +109,8 @@ async function sendOne(
       if (!ns?.sendMessageIMessage) throw new Error("imessage channel not registered");
       return ns.sendMessageIMessage(dest.chatId as string, capped);
     }
+    default:
+      throw new Error(`${dest.channel} channel not registered (this OpenClaw only sends to telegram, slack, discord, signal and imessage; newer versions send to any installed channel)`);
   }
 }
 

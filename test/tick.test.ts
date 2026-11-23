@@ -105,10 +105,11 @@ describe("tick", () => {
     enqueue(db, { source: "a", category: null, destination: "ghost", rawData: { text: "x" }, shouldFormat: false, dedupKey: null });
     const { runtime, sends } = fakeRuntime();
     const warnSpy = vi.fn();
-    await tick(db, baseConfig(), runtime as never, { ...logger, warn: warnSpy }, { force: false });
+    const result = await tick(db, baseConfig(), runtime as never, { ...logger, warn: warnSpy }, { force: false });
     expect(sends).toHaveLength(0);
     expect(getPending(db)).toHaveLength(1);
     expect(warnSpy).toHaveBeenCalled();
+    expect(result.leftUnsent).toBe(1);
   });
 
   it("leaves rows unsent when delivery throws and schedules a retry via backoff", async () => {
@@ -141,10 +142,11 @@ describe("tick", () => {
     enqueue(db, { source: "b", category: null, destination: "work", rawData: { text: "w" }, shouldFormat: false, dedupKey: null });
     const { runtime, sends } = fakeRuntime();
     const warnSpy = vi.fn();
-    await tick(db, baseConfig(), runtime as never, { ...logger, warn: warnSpy }, {
+    const result = await tick(db, baseConfig(), runtime as never, { ...logger, warn: warnSpy }, {
       force: false,
       activeDestinations: new Set(["default"]),
     });
+    expect(result).toMatchObject({ delivered: 1, leftUnsent: 1 });
     expect(sends).toHaveLength(1);
     expect(sends[0].channel).toBe("telegram");
     // "work" row stays pending; warn fires for the inactive destination.
@@ -159,6 +161,30 @@ describe("tick", () => {
     await tick(db, baseConfig(), runtime as never, logger, { force: false, onlyDestination: "work" });
     expect(sends).toHaveLength(1);
     expect(sends[0].channel).toBe("slack");
+    expect(getPending(db)).toHaveLength(1);
+  });
+
+  it("limits to one source and category when asked, leaving the rest pending", async () => {
+    enqueue(db, { source: "todo", category: "reminder", destination: "default", rawData: { text: "t" }, shouldFormat: false, dedupKey: null });
+    enqueue(db, { source: "calendar", category: "upcoming", destination: "default", rawData: { text: "u" }, shouldFormat: false, dedupKey: null });
+    enqueue(db, { source: "calendar", category: "day_reminders", destination: "default", rawData: { text: "d" }, shouldFormat: false, dedupKey: null });
+    const { runtime, sends } = fakeRuntime();
+    const r = await tick(db, baseConfig(), runtime as never, logger, {
+      force: false, onlySource: "calendar", onlyCategory: "day_reminders",
+    });
+    expect(r.delivered).toBe(1);
+    expect(sends).toHaveLength(1);
+    expect(getPending(db).map((row) => row.raw_data)).toEqual([
+      JSON.stringify({ text: "t" }), JSON.stringify({ text: "u" }),
+    ]);
+  });
+
+  it("says no-rows when nothing matches the chosen source", async () => {
+    enqueue(db, { source: "todo", category: null, destination: "default", rawData: { text: "t" }, shouldFormat: false, dedupKey: null });
+    const { runtime, sends } = fakeRuntime();
+    const r = await tick(db, baseConfig(), runtime as never, logger, { force: false, onlySource: "calendar" });
+    expect(r.skipped).toBe("no-rows");
+    expect(sends).toHaveLength(0);
     expect(getPending(db)).toHaveLength(1);
   });
 });

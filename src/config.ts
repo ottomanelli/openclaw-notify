@@ -1,4 +1,4 @@
-import type { NotifyConfig, ChannelName, Destination, WebhookTarget } from "./types.js";
+import type { NotifyConfig, ChannelName, KnownChannel, Destination, WebhookTarget } from "./types.js";
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -7,14 +7,20 @@ export class ConfigError extends Error {
   }
 }
 
-const VALID_CHANNELS: ReadonlySet<ChannelName> = new Set([
-  "telegram", "discord", "slack", "signal", "imessage",
-]);
+// A channel is named by its OpenClaw channel id: one of the bundled ones, or any other
+// installed channel plugin's. Whether it is installed is only known when a message is
+// sent, so all that is checked here is that it looks like an id.
+const CHANNEL_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const CHANNEL_ID_HELP = "must be an OpenClaw channel id (telegram, discord, slack, signal, imessage, or another installed channel's id)";
 
-// Only these channels forward threadId. The others silently discard it in
-// deliver.ts — reject at parse time so a user doesn't spend debugging cycles
-// wondering why their "thread" never materializes.
-const CHANNELS_WITH_THREAD_SUPPORT: ReadonlySet<ChannelName> = new Set(["telegram", "slack"]);
+function isChannelId(value: unknown): value is ChannelName {
+  return typeof value === "string" && CHANNEL_ID.test(value);
+}
+
+// These channels have no threads, and would silently discard a threadId in deliver.ts —
+// reject at parse time so a user doesn't spend debugging cycles wondering why their
+// "thread" never materializes. Any other channel is handed the threadId as given.
+const CHANNELS_WITHOUT_THREADS: ReadonlySet<KnownChannel> = new Set(["discord", "signal", "imessage"]);
 
 // Must match PROVIDER_PRIORITY in format.ts. Duplicated here so the config
 // module has no runtime dependency on format.ts (avoids pulling node:crypto
@@ -74,18 +80,18 @@ function parseDestination(name: string, raw: unknown): Destination {
   // choose the message style (it defaults to telegram's).
   if (webhooks.length > 0 && (o.chatId == null || o.chatId === "")) {
     const style = o.channel == null ? "telegram" : o.channel;
-    if (typeof style !== "string" || !VALID_CHANNELS.has(style as ChannelName)) {
-      throw new ConfigError(`destinations.${name}.channel: must be one of ${[...VALID_CHANNELS].join(", ")}`);
+    if (!isChannelId(style)) {
+      throw new ConfigError(`destinations.${name}.channel: ${CHANNEL_ID_HELP}`);
     }
     if (o.threadId != null) {
       throw new ConfigError(`destinations.${name}.threadId: needs a chatId`);
     }
-    return { channel: style as ChannelName, chatId: null, threadId: null, webhooks };
+    return { channel: style, chatId: null, threadId: null, webhooks };
   }
   const channel = o.channel;
   const chatId = o.chatId;
-  if (typeof channel !== "string" || !VALID_CHANNELS.has(channel as ChannelName)) {
-    throw new ConfigError(`destinations.${name}.channel: must be one of ${[...VALID_CHANNELS].join(", ")}`);
+  if (!isChannelId(channel)) {
+    throw new ConfigError(`destinations.${name}.channel: ${CHANNEL_ID_HELP}`);
   }
   if (typeof chatId !== "string" || chatId.length === 0) {
     throw new ConfigError(`destinations.${name}.chatId: required non-empty string (or give webhooks)`);
@@ -94,7 +100,7 @@ function parseDestination(name: string, raw: unknown): Destination {
   if (threadId != null && typeof threadId !== "string" && typeof threadId !== "number") {
     throw new ConfigError(`destinations.${name}.threadId: must be string, number, or null`);
   }
-  if (threadId != null && !CHANNELS_WITH_THREAD_SUPPORT.has(channel as ChannelName)) {
+  if (threadId != null && CHANNELS_WITHOUT_THREADS.has(channel as KnownChannel)) {
     throw new ConfigError(`destinations.${name}.threadId: "${channel}" channel does not support threads; remove threadId or use telegram/slack`);
   }
   // Telegram message_thread_id is an integer over the wire. Reject empty
@@ -107,7 +113,7 @@ function parseDestination(name: string, raw: unknown): Destination {
     }
   }
   return {
-    channel: channel as ChannelName,
+    channel,
     chatId,
     threadId: (threadId ?? null) as string | number | null,
     ...(webhooks.length > 0 ? { webhooks } : {}),

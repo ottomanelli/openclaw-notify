@@ -15,6 +15,11 @@ export type TickLogger = {
 export type TickOptions = {
   force?: boolean;
   onlyDestination?: string;
+  // Only rows from this producer (and, with onlyCategory, this subtype). Lets a
+  // producer flush its own rows right after enqueueing them without also
+  // sending everything else that happens to be waiting.
+  onlySource?: string;
+  onlyCategory?: string;
   activeDestinations?: Set<string>;
 };
 
@@ -27,6 +32,9 @@ export type TickResult = {
   delivered: number;        // rows stamped sent_at this tick
   failedTransient: number;  // rows released for retry on the next tick
   failedTerminal: number;   // rows that crossed MAX_DELIVERY_ATTEMPTS
+  // Rows not attempted because their destination cannot be used from this process (its
+  // channel is not loaded here) or is no longer in the config. They stay pending.
+  leftUnsent?: number;
 };
 
 // Throttle per destination-name so a misconfigured destination doesn't spam
@@ -56,12 +64,16 @@ export async function tick(
     return { ...result, skipped: "quiet-hours" };
   }
 
-  const rows = getPending(db);
+  const rows = getPending(db).filter(
+    (r) =>
+      (!opts.onlyDestination || r.destination === opts.onlyDestination) &&
+      (!opts.onlySource || r.source === opts.onlySource) &&
+      (!opts.onlyCategory || r.category === opts.onlyCategory),
+  );
   if (rows.length === 0) return { ...result, skipped: "no-rows" };
 
   const groups = new Map<string, QueueRow[]>();
   for (const r of rows) {
-    if (opts.onlyDestination && r.destination !== opts.onlyDestination) continue;
     const list = groups.get(r.destination) ?? [];
     list.push(r);
     groups.set(r.destination, list);
@@ -75,6 +87,7 @@ export async function tick(
         `unknown:${destName}`,
         `notify: unknown destination "${destName}" (${group.length} rows); leaving unsent`,
       );
+      result.leftUnsent = (result.leftUnsent ?? 0) + group.length;
       continue;
     }
     if (opts.activeDestinations && !opts.activeDestinations.has(destName)) {
@@ -83,6 +96,7 @@ export async function tick(
         `inactive:${destName}`,
         `notify: destination "${destName}" channel not registered (${group.length} rows); leaving unsent`,
       );
+      result.leftUnsent = (result.leftUnsent ?? 0) + group.length;
       continue;
     }
 

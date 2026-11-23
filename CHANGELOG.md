@@ -7,15 +7,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`notify send` and `notify doctor` are done by the running Gateway.** Run from a terminal, a script or a
+  scheduled job, they are short-lived CLI processes, into which OpenClaw loads neither channel plugins nor
+  model keys: a destination with a chat could not be delivered from there (`<channel> channel not
+  registered`, counted against the row's retry budget), LLM formatting fell back to the template, and
+  `doctor` reported healthy setups as broken. The plugin now registers Gateway methods `notify.flush` and
+  `notify.doctor`, and the two commands call them through OpenClaw's own CLI Gateway client. With no Gateway
+  running they say so and work in their own process as before, except that rows for a chat are left
+  pending instead of being tried and failed. `--local` skips the Gateway. `send` prints `left N pending`
+  when rows were left that way.
+- **Any OpenClaw channel as a destination.** `channel` was limited to telegram, discord, slack, signal and
+  imessage. It may now be any installed channel's id (a channel plugin of your own, for example); such a
+  channel is sent plain text through its outbound adapter, cut to the adapter's `textChunkLimit`.
+  Needs an OpenClaw with outbound adapters.
 - **Webhook destinations.** A destination may list `webhooks` (`[{ "url": "...", "headers": {...} }]`). Each
   delivered message is also POSTed there as JSON: `{ text, plain, destination, sources, categories, count }`
   (`plain` is `text` without Markdown marks). With a `chatId`, the chat decides success and webhooks are
   best-effort (a failure is logged, the rows stay sent, so the chat is not messaged twice). With webhooks and
   no `chatId`, the webhooks are the delivery: all must answer 2xx or the batch is retried. Existing
   chat-only destinations are unchanged.
+- **`notify send --source <name>` and `--category <name>`.** Flush only one producer's rows. A job that
+  enqueues a message and wants it out now no longer sends everything else that is waiting with it (rows
+  that need LLM formatting can fail when flushed from a plain CLI process; they stay queued for the
+  Gateway's own tick).
 
 ### Fixed
 
+- `notify doctor` no longer reports a destination made of webhooks only as "channel NOT registered":
+  it has no chat, so there is no channel to look for.
 - Sending on current OpenClaw. The per-channel send functions the plugin called
   (`runtime.channel.telegram.sendMessageTelegram` and its siblings) no longer exist;
   messages now go through `runtime.channel.outbound.loadAdapter(<channel>)` and the

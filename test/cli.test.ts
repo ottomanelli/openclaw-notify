@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { Command } from "commander";
-import { registerNotifyCli, runDoctor } from "../src/cli.js";
+import { registerNotifyCli, runDoctor, type CliDeps } from "../src/cli.js";
 import { openDb, closeDb } from "../src/db.js";
 import { enqueue } from "../src/queue.js";
 import type { TickResult } from "../src/tick.js";
@@ -43,6 +43,7 @@ function setup(
   cfg: NotifyConfig,
   runtime: ReturnType<typeof defaultRuntime> = defaultRuntime(),
   tickReturn: TickResult | void = undefined,
+  remote: Pick<CliDeps, "flushRemote" | "doctorRemote"> = {},
 ) {
   const program = new Command();
   program.exitOverride();
@@ -53,8 +54,19 @@ function setup(
     config: cfg,
     tickFn,
     runtime: runtime as never,
+    ...remote,
   });
   return { program, tickFn, runtime };
+}
+
+function captureStderr() {
+  const lines: string[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => lines.push(args.map(String).join(" "));
+  return {
+    lines,
+    restore: () => { console.error = orig; },
+  };
 }
 
 function captureStdout() {
@@ -224,6 +236,17 @@ describe("cli send", () => {
     expect(tickFn).toHaveBeenCalledWith({ force: false, onlyDestination: "work" });
   });
 
+  it("passes --source and --category", async () => {
+    const { program, tickFn } = setup(baseConfig());
+    const cap = captureStdout();
+    try {
+      await program.parseAsync(["node", "cli", "notify", "send", "--source", "calendar", "--category", "day_reminders"]);
+    } finally { cap.restore(); }
+    expect(tickFn).toHaveBeenCalledWith({
+      force: false, onlyDestination: undefined, onlySource: "calendar", onlyCategory: "day_reminders",
+    });
+  });
+
   it("rejects unknown --destination on send", async () => {
     const { program } = setup(baseConfig());
     await expect(
@@ -293,11 +316,171 @@ describe("cli send", () => {
     expect(cap.lines.join("\n")).toMatch(/no pending rows \(1 backing off, next in \d+m\)/);
   });
 
+  it("counts only the chosen source's backing-off rows when --source is given", async () => {
+    const dbPath = path.join(tmpDir, "notifications.db");
+    const db = openDb(dbPath);
+    try {
+      enqueue(db, {
+        source: "todo", category: null, destination: "default",
+        rawData: { text: "x" }, shouldFormat: true, dedupKey: null,
+      });
+      db.prepare("UPDATE notifications SET next_attempt_at = ? WHERE id = 1")
+        .run(Date.now() + 8 * 60_000);
+    } finally {
+      closeDb(db);
+    }
+    const { program } = setup(baseConfig(), defaultRuntime(), {
+      delivered: 0, failedTransient: 0, failedTerminal: 0, skipped: "no-rows",
+    });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send", "--source", "calendar"]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toEqual("no pending rows");
+  });
+
   it("prints a 'no tick ran' hint when the plugin short-circuited", async () => {
     const { program } = setup(baseConfig());  // default tickFn returns void
     const cap = captureStdout();
     try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
     expect(cap.lines.join("\n")).toMatch(/no tick ran/);
+  });
+});
+
+describe("cli send through the running Gateway", () => {
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "notify-send-gw-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const counts: TickResult = { delivered: 2, failedTransient: 0, failedTerminal: 0 };
+
+  it("asks the Gateway, prints its counts, and does nothing in this process", async () => {
+    const flushRemote = vi.fn(async () => ({ answered: true as const, value: counts }));
+    const { program, tickFn } = setup(baseConfig(), defaultRuntime(), undefined, { flushRemote });
+    const cap = captureStdout();
+    try {
+      await program.parseAsync([
+        "node", "cli", "notify", "send", "--force", "--source", "calendar", "--category", "day_reminders",
+      ]);
+    } finally { cap.restore(); }
+    expect(flushRemote).toHaveBeenCalledWith({ force: true, onlySource: "calendar", onlyCategory: "day_reminders" });
+    expect(tickFn).not.toHaveBeenCalled();
+    expect(cap.lines.join("\n")).toBe("delivered 2");
+  });
+
+  it("prints the Gateway's 'quiet hours' answer", async () => {
+    const flushRemote = vi.fn(async () => ({
+      answered: true as const,
+      value: { skipped: "quiet-hours" as const, delivered: 0, failedTransient: 0, failedTerminal: 0 },
+    }));
+    const { program } = setup(baseConfig(), defaultRuntime(), undefined, { flushRemote });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toMatch(/skipped: quiet hours/);
+  });
+
+  it("says no tick ran when the Gateway ran none", async () => {
+    const flushRemote = vi.fn(async () => ({ answered: true as const, value: undefined }));
+    const { program, tickFn } = setup(baseConfig(), defaultRuntime(), counts, { flushRemote });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
+    expect(tickFn).not.toHaveBeenCalled();
+    expect(cap.lines.join("\n")).toMatch(/no tick ran/);
+  });
+
+  it("flushes in this process, and says why, when no Gateway answers", async () => {
+    const flushRemote = vi.fn(async () => ({ answered: false as const, why: "no Gateway is running" }));
+    const { program, tickFn } = setup(baseConfig(), defaultRuntime(), counts, { flushRemote });
+    const out = captureStdout();
+    const err = captureStderr();
+    try { await program.parseAsync(["node", "cli", "notify", "send", "--source", "todo"]); }
+    finally { out.restore(); err.restore(); }
+    expect(tickFn).toHaveBeenCalledWith({ force: false, onlySource: "todo" });
+    expect(err.lines.join("\n")).toMatch(/flushing in this process \(no Gateway is running\)/);
+    expect(out.lines.join("\n")).toBe("delivered 2");
+  });
+
+  it("--local does not ask the Gateway", async () => {
+    const flushRemote = vi.fn();
+    const { program, tickFn } = setup(baseConfig(), defaultRuntime(), counts, { flushRemote: flushRemote as never });
+    const out = captureStdout();
+    const err = captureStderr();
+    try { await program.parseAsync(["node", "cli", "notify", "send", "--local"]); }
+    finally { out.restore(); err.restore(); }
+    expect(flushRemote).not.toHaveBeenCalled();
+    expect(tickFn).toHaveBeenCalledWith({ force: false });
+    expect(err.lines).toHaveLength(0);
+  });
+
+  it("fails, without flushing here, when the Gateway may still be working on it", async () => {
+    const flushRemote = vi.fn(async () => { throw new Error("the Gateway did not answer"); });
+    const { program, tickFn } = setup(baseConfig(), defaultRuntime(), counts, { flushRemote });
+    await expect(program.parseAsync(["node", "cli", "notify", "send"])).rejects.toThrow(/did not answer/);
+    expect(tickFn).not.toHaveBeenCalled();
+  });
+
+  it("says how many rows were left for a destination this process cannot use", async () => {
+    const left: TickResult = { delivered: 1, failedTransient: 0, failedTerminal: 0, leftUnsent: 3 };
+    const { program } = setup(baseConfig(), defaultRuntime(), left);
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "send"]); } finally { cap.restore(); }
+    expect(cap.lines.join("\n")).toMatch(/^delivered 1, left 3 pending/);
+  });
+
+  it("checks the filters before asking anyone", async () => {
+    const flushRemote = vi.fn();
+    // A fresh program each time: commander keeps option values between parses.
+    const fresh = () => setup(baseConfig(), defaultRuntime(), undefined, { flushRemote: flushRemote as never }).program;
+    await expect(
+      fresh().parseAsync(["node", "cli", "notify", "send", "--destination", "ghost"]),
+    ).rejects.toThrow(/Unknown --destination/);
+    await expect(
+      fresh().parseAsync(["node", "cli", "notify", "send", "--source", "x".repeat(65)]),
+    ).rejects.toThrow(/--source too long/);
+    expect(flushRemote).not.toHaveBeenCalled();
+  });
+});
+
+describe("cli doctor through the running Gateway", () => {
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "notify-doctor-gw-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    process.exitCode = 0;
+  });
+
+  it("prints the Gateway's report and takes its verdict", async () => {
+    const doctorRemote = vi.fn(async () => ({
+      answered: true as const,
+      value: { ok: false, lines: ['✗ destination "default": pushapp channel NOT registered'] },
+    }));
+    const { program } = setup(baseConfig(), defaultRuntime(), undefined, { doctorRemote });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "doctor", "--skip-llm"]); } finally { cap.restore(); }
+    expect(doctorRemote).toHaveBeenCalledWith({ skipLlm: true });
+    expect(cap.lines[0]).toBe("Checked in the running Gateway.");
+    expect(cap.lines.join("\n")).toMatch(/pushapp channel NOT registered/);
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("checks from this process, and says so, when no Gateway answers", async () => {
+    const doctorRemote = vi.fn(async () => ({ answered: false as const, why: "no Gateway is running" }));
+    const { program } = setup(baseConfig(), defaultRuntime(), undefined, { doctorRemote });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "doctor", "--skip-llm"]); } finally { cap.restore(); }
+    expect(cap.lines[0]).toMatch(/Checked from this process \(no Gateway is running\)/);
+    expect(cap.lines.join("\n")).toMatch(/config: valid/);
+  });
+
+  it("--local does not ask the Gateway", async () => {
+    const doctorRemote = vi.fn();
+    const { program } = setup(baseConfig(), defaultRuntime(), undefined, { doctorRemote: doctorRemote as never });
+    const cap = captureStdout();
+    try { await program.parseAsync(["node", "cli", "notify", "doctor", "--skip-llm", "--local"]); } finally { cap.restore(); }
+    expect(doctorRemote).not.toHaveBeenCalled();
+    expect(cap.lines[0]).toMatch(/Checked from this process \(--local\)/);
   });
 });
 
@@ -486,6 +669,22 @@ describe("cli doctor", () => {
     expect(out).toMatch(/queue: 0 pending, 0 failed/);
   });
 
+  it("does not look for a channel when a destination is webhooks with no chat", async () => {
+    const cfg = baseConfig({
+      destinations: {
+        default: {
+          channel: "telegram", chatId: null, threadId: null,
+          webhooks: [{ url: "http://127.0.0.1:9/hook", headers: {} }],
+        },
+      },
+    });
+    const runtime = defaultRuntime();
+    delete (runtime.channel as Record<string, unknown>).telegram;
+    const report = await runDoctor(doctorDeps({ cfg, runtime, skipLlm: true }));
+    expect(report.ok).toBe(true);
+    expect(report.lines.join("\n")).toMatch(/destination "default": 1 webhook, no chat/);
+  });
+
   it("--skip-llm suppresses the probe even when llm is enabled", async () => {
     const cfg = baseConfig({ llm: { enabled: true, provider: "anthropic", model: null } });
     const runtime = defaultRuntime();
@@ -524,6 +723,17 @@ describe("cli doctor", () => {
     const report = await runDoctor(doctorDeps({ cfg, runtime }));
     expect(report.ok).toBe(false);
     expect(report.lines.join("\n")).toMatch(/llm: no provider has an API key/);
+  });
+
+  it("reports, rather than crashing, when model keys cannot be read from this process", async () => {
+    const cfg = baseConfig({ llm: { enabled: true, provider: "openai", model: null } });
+    const runtime = defaultRuntime();
+    runtime.modelAuth = {
+      resolveApiKeyForProvider: vi.fn(async () => { throw new Error("Shared auth store ownership is not prepared"); }),
+    } as never;
+    const report = await runDoctor(doctorDeps({ cfg, runtime }));
+    expect(report.ok).toBe(false);
+    expect(report.lines.join("\n")).toMatch(/llm: model keys cannot be read from this process — Shared auth store/);
   });
 
   it("probes the LLM with a tiny prompt and reports success", async () => {

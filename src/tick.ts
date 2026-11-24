@@ -1,7 +1,7 @@
 import type { Db } from "./db.js";
 import { getPending, markSent, claimRows, releaseRows } from "./queue.js";
 import { nowInQuietHours } from "./schedule.js";
-import { formatBatch, renderTemplate } from "./format.js";
+import { formatBatch, renderTemplate, withoutRepeats } from "./format.js";
 import { deliver } from "./deliver.js";
 import type { NotifyConfig, QueueRow, Destination, RuntimeBridge } from "./types.js";
 
@@ -117,15 +117,18 @@ export async function tick(
         );
       }
       const claimedIds = claimed.map((r) => r.id);
+      // The same notification queued more than once (repeated while it was held) is
+      // said once; every one of its rows is still marked sent below.
+      const said = withoutRepeats(claimed);
       try {
         const message = batch.useLlm
-          ? await formatBatch(runtime, claimed, cfg.llm, cfg.personality, { channel: destCfg.channel, logger })
-          : renderTemplate(claimed, destCfg.channel);
+          ? await formatBatch(runtime, said, cfg.llm, cfg.personality, { channel: destCfg.channel, logger, timeZone: cfg.quietHours?.tz })
+          : renderTemplate(said, destCfg.channel);
         const deliveryResult = await deliver(runtime, destCfg, message, {
           destination: destName,
-          sources: [...new Set(claimed.map((row) => row.source))],
-          categories: [...new Set(claimed.map((row) => row.category).filter((c): c is string => Boolean(c)))],
-          count: claimed.length,
+          sources: [...new Set(said.map((row) => row.source))],
+          categories: [...new Set(said.map((row) => row.category).filter((c): c is string => Boolean(c)))],
+          count: said.length,
         });
         if (deliveryResult.ok) {
           markSent(db, claimedIds);

@@ -72,6 +72,31 @@ describe("tick", () => {
     expect(r.delivered).toBe(0);
   });
 
+  it("says a reminder that was queued again while held once, and marks every row sent", async () => {
+    // Queued at 21:30 and every two hours after, each outside the 15-minute window in
+    // which enqueue folds a repeat into the row that is waiting.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-11-23T21:30:00-05:00"));
+      for (let n = 1; n <= 5; n += 1) {
+        enqueue(db, { source: "todo", category: "reminder", destination: "default", rawData: { text: `Return the books (reminder ${n})` }, shouldFormat: false, dedupKey: "todo:7:reminder" }, { dedupWindowMin: 15 });
+        enqueue(db, { source: "todo", category: "reminder", destination: "default", rawData: { text: "Water the plants" }, shouldFormat: false, dedupKey: n === 1 ? "todo:8:reminder" : `other:${n}` }, { dedupWindowMin: 15 });
+        vi.advanceTimersByTime(2 * 3600 * 1000);
+      }
+      expect(getPending(db)).toHaveLength(10);
+      const { runtime, sends } = fakeRuntime();
+      const r = await tick(db, baseConfig(), runtime as never, logger, { force: false });
+      expect(sends).toHaveLength(1);
+      expect(sends[0].text.match(/Return the books/g)).toHaveLength(1);
+      expect(sends[0].text).toContain("Return the books (reminder 5)");
+      expect(sends[0].text.match(/Water the plants/g)).toHaveLength(5);   // different keys: different notifications
+      expect(r.delivered).toBe(10);
+      expect(getPending(db)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("returns skipped:no-rows when the queue is empty", async () => {
     const { runtime } = fakeRuntime();
     const r = await tick(db, baseConfig(), runtime as never, logger, { force: false });

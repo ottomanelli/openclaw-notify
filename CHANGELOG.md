@@ -6,6 +6,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **A reminder repeated while it was held is said once.** A consumer that repeats a reminder every few hours
+  (a to-do reminded every two) queues it again under the same dedup key while the earlier ones are still
+  held, by quiet hours say. Enqueue folds a repeat only into a row younger than `dedupWindowMin` (15
+  minutes by default), so a night of quiet hours left five rows for one reminder, and the model wording
+  the batch said it "shows up five times" and offered to clear the duplicates. Rows of one batch with the
+  same source and dedup key are now one notification: the newest is said, all are marked sent. Setting
+  `dedupWindowMin` longer than your quiet hours also keeps the queue itself to one row.
+- **The model is told today's date.** A reminder's due date reached the model with nothing to compare it
+  to, and one two days past was called "coming up soon". The instructions now give today's date (in the
+  quiet hours' time zone, or the machine's), say that a due date before it is overdue, and ask for the
+  reminders only: nothing about the list itself, and no offers beyond the reply hints.
+
+
 ### Added
 - **`notify send` and `notify doctor` are done by the running Gateway.** Run from a terminal, a script or a
   scheduled job, they are short-lived CLI processes, into which OpenClaw loads neither channel plugins nor

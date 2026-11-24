@@ -497,6 +497,147 @@ describe("callLlm request options", () => {
   });
 });
 
+describe("formatting through OpenClaw", () => {
+  const rows = () => [row({ source: "todo", raw_data: JSON.stringify({ text: "Buy beans" }) })];
+  function host(reply: unknown = { text: "  Don't forget the beans.  ", provider: "anthropic", model: "claude-sonnet-5-5" }) {
+    const asked: Array<Record<string, unknown>> = [];
+    const complete = vi.fn(async (params: Record<string, unknown>) => {
+      asked.push(params);
+      if (reply instanceof Error) throw reply;
+      return reply;
+    });
+    // A key lookup or a request of the plugin's own would be the old way: neither may happen.
+    const keys = vi.fn(async () => ({ apiKey: "k" }));
+    const fetchFn = vi.fn(async () => { throw new Error("the plugin called a provider itself"); });
+    return { rt: { llm: { complete }, modelAuth: { resolveApiKeyForProvider: keys } }, asked, keys, fetchFn };
+  }
+
+  it("hands the words to OpenClaw and names no model when the settings name none", async () => {
+    const { formatBatch } = await import("../src/format.js");
+    const { rt, asked, keys, fetchFn } = host();
+    const out = await formatBatch(rt as never, rows(), { enabled: true, provider: null, model: null }, "Casual.", { fetchFn: fetchFn as never });
+    expect(out).toBe("Don't forget the beans.");
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ purpose: "notify.format", maxTokens: 2000, reasoning: "low" });
+    expect(asked[0]).not.toHaveProperty("model");
+    expect(asked[0]).not.toHaveProperty("temperature");
+    expect(asked[0].messages).toEqual([{ role: "user", content: expect.stringContaining("Buy beans") }]);
+    expect(String(asked[0].systemPrompt)).toContain("Casual.");
+    expect(asked[0].signal).toBeInstanceOf(AbortSignal);
+    expect(keys).not.toHaveBeenCalled();
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("names the model the settings name, as OpenClaw writes one", async () => {
+    const { namedModel, CHEAP_MODELS } = await import("../src/format.js");
+    expect(namedModel({ enabled: true, provider: null, model: null })).toBeUndefined();
+    expect(namedModel({ enabled: true, provider: "anthropic", model: "claude-haiku-5-5" })).toBe("anthropic/claude-haiku-5-5");
+    expect(namedModel({ enabled: true, provider: "openai", model: null })).toBe(`openai/${CHEAP_MODELS.openai}`);
+    expect(namedModel({ enabled: true, provider: "openai", model: "anthropic/claude-haiku-5-5" })).toBe("anthropic/claude-haiku-5-5");
+    expect(namedModel({ enabled: true, provider: null, model: " sonnet " })).toBe("sonnet");
+
+    const { formatBatch } = await import("../src/format.js");
+    const { rt, asked } = host();
+    await formatBatch(rt as never, rows(), { enabled: true, provider: "anthropic", model: "claude-haiku-5-5" }, null);
+    expect(asked[0].model).toBe("anthropic/claude-haiku-5-5");
+  });
+
+  it("works out OpenClaw's small model for \"utility\", following the provider OpenClaw uses", async () => {
+    const { namedModel, utilityModel, selectProviderAndModel, CHEAP_MODELS } = await import("../src/format.js");
+    const utility = { enabled: true, provider: null, model: "utility" };
+    const openclaw = (cfg: unknown, own?: { provider?: string; model?: string }) => ({
+      config: { current: () => cfg },
+      modelConfig: { resolveDefaultModelForAgent: vi.fn(() => own) },
+      modelAuth: { resolveApiKeyForProvider: vi.fn(async () => ({ apiKey: "k" })) },
+    }) as never;
+
+    // The provider of the agent's own model, with this plugin's cheap model for it.
+    expect(namedModel(utility, openclaw({}, { provider: "anthropic", model: "claude-sonnet-5-5" }))).toBe(`anthropic/${CHEAP_MODELS.anthropic}`);
+    expect(namedModel(utility, openclaw({}, { provider: "openai", model: "gpt-6.1-terra" }))).toBe(`openai/${CHEAP_MODELS.openai}`);
+    // A utility model named in OpenClaw's settings wins, in either form it may be written.
+    expect(namedModel(utility, openclaw({ agents: { defaults: { utilityModel: " openai/gpt-5.6-luna " } } }, { provider: "anthropic" }))).toBe("openai/gpt-5.6-luna");
+    expect(namedModel(utility, openclaw({ agents: { defaults: { utilityModel: { primary: "anthropic/claude-haiku-5-5" } } } }, { provider: "openai" }))).toBe("anthropic/claude-haiku-5-5");
+    // Nothing to go on: no model is named, and OpenClaw's own is used.
+    expect(namedModel(utility, openclaw({}, { provider: "xai", model: "grok" }))).toBeUndefined();
+    expect(namedModel(utility, openclaw({}, undefined))).toBeUndefined();
+    expect(namedModel(utility, undefined)).toBeUndefined();
+    expect(utilityModel({ config: { current: () => { throw new Error("no settings"); } } } as never)).toBeUndefined();
+    // With a provider named, it is that provider's cheap model.
+    expect(namedModel({ enabled: true, provider: "groq", model: "utility" }, openclaw({}, { provider: "anthropic" }))).toBe(`groq/${CHEAP_MODELS.groq}`);
+    // On an older OpenClaw, where the plugin calls the provider itself, "utility" is not sent as a model's name.
+    expect(await selectProviderAndModel(openclaw({}), { enabled: true, provider: "openai", model: "utility" }))
+      .toEqual({ provider: "openai", model: CHEAP_MODELS.openai, apiKey: "k" });
+
+    const { formatBatch } = await import("../src/format.js");
+    const { rt, asked } = host();
+    Object.assign(rt, { config: { current: () => ({}) }, modelConfig: { resolveDefaultModelForAgent: () => ({ provider: "anthropic", model: "claude-sonnet-5-5" }) } });
+    await formatBatch(rt as never, rows(), utility, null);
+    expect(asked[0].model).toBe(`anthropic/${CHEAP_MODELS.anthropic}`);
+  });
+
+  it("falls back to the template, and says so once, when OpenClaw cannot answer", async () => {
+    const { formatBatch } = await import("../src/format.js");
+    const logger = { error: vi.fn(), debug: vi.fn() };
+    for (const reply of [new Error("model override is not allowed for plugin notify"), { text: "   ", provider: "anthropic", model: "x" }]) {
+      const { rt, fetchFn } = host(reply);
+      const out = await formatBatch(rt as never, rows(), { enabled: true, provider: "groq", model: `m-${String(reply instanceof Error)}` }, null, { fetchFn: fetchFn as never, logger });
+      expect(out).toContain("Buy beans");
+      expect(fetchFn).not.toHaveBeenCalled();
+    }
+    const said = logger.error.mock.calls.flat().join("\n");
+    expect(said).toMatch(/through OpenClaw\/groq\/m-true failing/);
+    expect(said).toMatch(/allowModelOverride: true/);
+    expect(said).toMatch(/came back empty/);
+  });
+
+  it("asks no model at all when formatting is switched off", async () => {
+    const { formatBatch } = await import("../src/format.js");
+    const { rt, asked } = host();
+    const out = await formatBatch(rt as never, rows(), { enabled: false, provider: null, model: null }, null);
+    expect(out).toContain("Buy beans");
+    expect(asked).toHaveLength(0);
+  });
+});
+
+describe("callLlm with Claude", () => {
+  const ask = async (model: string, reply: Record<string, unknown>) => {
+    const { callLlm } = await import("../src/format.js");
+    let body: Record<string, unknown> = {};
+    const fetchFn = vi.fn(async (_url: string, opts: RequestInit) => {
+      body = JSON.parse(String(opts.body));
+      return { ok: true, status: 200, json: async () => reply, text: async () => "" } as unknown as Response;
+    });
+    const text = await callLlm({ provider: "anthropic", model, apiKey: "k" } as never, "sys", "user", fetchFn as never);
+    return { body, text };
+  };
+
+  it("sends every Claude model the same request, with no temperature and room to think", async () => {
+    for (const model of ["claude-haiku-5-5", "claude-haiku-4-5"]) {
+      const { body } = await ask(model, { content: [{ type: "text", text: "ok" }] });
+      expect(body).toEqual({ model, system: "sys", max_tokens: 2000, messages: [{ role: "user", content: "user" }] });
+    }
+  });
+
+  it("reads the answer by kind of block when the model thought first", async () => {
+    const { text } = await ask("claude-haiku-5-5", {
+      stop_reason: "end_turn",
+      content: [
+        { type: "thinking", thinking: "", signature: "sig" },
+        { type: "text", text: "Don't forget " },
+        { type: "text", text: "the beans." },
+      ],
+    });
+    expect(text).toBe("Don't forget the beans.");
+  });
+
+  it("says why when Claude gave no text", async () => {
+    await expect(ask("claude-haiku-5-5", { stop_reason: "max_tokens", content: [{ type: "thinking", thinking: "", signature: "sig" }] }))
+      .rejects.toThrow(/Anthropic response missing content \(stop_reason: max_tokens\)/);
+    await expect(ask("claude-haiku-5-5", { stop_reason: "refusal", content: [] }))
+      .rejects.toThrow(/stop_reason: refusal/);
+  });
+});
+
 describe("callLlm error scrubbing", () => {
   const resolved = { provider: "openai", model: "gpt-6-luna", apiKey: "k" };
   const fakeResp = (status: number, body: string): Response =>

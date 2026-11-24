@@ -112,7 +112,30 @@ export type OutboundAdapter = {
   sendText?: (ctx: OutboundSendContext) => Promise<{ messageId?: string; channel?: string }>;
 };
 
+/**
+ * OpenClaw's own text completion for plugins (`api.runtime.llm.complete`): the host picks
+ * the model, holds the key and knows what each provider's models accept. Only the fields
+ * this plugin passes and reads are typed here.
+ */
+export type HostLlm = {
+  complete: (params: {
+    messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+    systemPrompt?: string;
+    /** A model as OpenClaw names it ("provider/model"). Left out: the agent's own model. */
+    model?: string;
+    maxTokens?: number;
+    reasoning?: string;
+    purpose?: string;
+    signal?: AbortSignal;
+  }) => Promise<{ text: string; provider: string; model: string }>;
+};
+
 export type RuntimeBridge = {
+  /** Current OpenClaw. When present, every model call goes through it. */
+  llm?: HostLlm;
+  /** OpenClaw's settings as they are now, and which model its agent uses: for "utility". */
+  config?: { current: () => unknown };
+  modelConfig?: { resolveDefaultModelForAgent: (params: { cfg: unknown }) => { provider?: string; model?: string } | undefined };
   modelAuth: {
     resolveApiKeyForProvider: (params: { provider: string }) => Promise<{ apiKey?: string }>;
   };

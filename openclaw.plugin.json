@@ -215,12 +215,12 @@
     },
     "llm.provider": {
       "label": "Provider override",
-      "help": "Force a specific provider. Leave null to auto-pick whichever provider openclaw has credentials for.",
+      "help": "Name a provider. Leave null, with the model, to use OpenClaw's own model for the agent.",
       "advanced": true
     },
     "llm.model": {
       "label": "Model override",
-      "help": "Force a specific model. Leave null to use a cheap default per provider.",
+      "help": "Name a model. With a provider and no model, that provider's cheap default is used. A named model needs plugins.entries.notify.llm.allowModelOverride: true.",
       "advanced": true
     },
     "personality": {

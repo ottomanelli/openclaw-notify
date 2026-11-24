@@ -7,7 +7,7 @@ Shared notifications queue for OpenClaw with batched LLM-formatted delivery. Con
 - **One queue for all skills** — reminders from todo and events from calendar collapse into a single natural-language message.
 - **Multi-destination routing** — route `--destination work` to Slack and the rest to Telegram (or iMessage / Discord / Signal).
 - **Webhooks** — send each delivered message to your own service as well as, or instead of, a chat: a phone push relay, a display, an automation. See [Where notifications go](#where-notifications-go).
-- **LLM formatting via your OpenClaw keys** — no per-skill API keys. Cheap model auto-selected per provider.
+- **LLM formatting through OpenClaw** — no per-skill API keys, and no request of the plugin's own to a provider: OpenClaw runs the model. Its own model by default; name a cheaper one if you like.
 - **Quiet hours** — TZ-aware window that accumulates notifications and flushes on the other side.
 - **Dedup** — consumers pass a `--dedup-key`; repeated enqueues within a window update the pending row in place. Dedup is scoped to `(source, dedup_key, destination)`, so `todo` and `calendar` can both use `--dedup-key reminder:1` without colliding. Once a row has been claimed by a tick, further enqueues with the same key insert a new row (safer than mutating a row that's mid-delivery).
 
@@ -206,7 +206,35 @@ The service runs on an interval inside the OpenClaw gateway. Each tick:
 4. For each destination: partition `should_format=1` (LLM) vs `0` (template); atomically claim the batch, format, deliver.
 5. Stamp `sent_at` on delivered rows; release reservations on failure so the next tick retries.
 
-LLM provider is auto-selected from the first configured provider in `anthropic → openai → google → groq → ollama` that has a key. Cheap model auto-selection: `claude-haiku-4-5`, `gpt-6-luna`, `gemini-1.5-flash`, `llama-3.1-8b-instant`, `llama3.2:3b`.
+### Which model formats
+
+On a current OpenClaw the plugin hands the words to OpenClaw's own completion for plugins
+(`api.runtime.llm.complete`). OpenClaw picks the model, holds the key and shapes the request
+for the provider, so the plugin follows whatever OpenClaw is set to use and needs no change
+when a provider's models change what they accept.
+
+| `llm.provider` | `llm.model` | Model used |
+|---|---|---|
+| `null` | `null` | OpenClaw's own model for the agent. Follows a change of provider by itself. |
+| `null` | `"utility"` | The small model of whichever provider OpenClaw uses: the utility model OpenClaw's settings name (`agents.defaults.utilityModel`), or else the cheap model below for the provider of the agent's own model. Follows a change of provider by itself. If neither can be told, OpenClaw's own model. |
+| set | `null` | That provider's cheap model: `claude-haiku-5-5`, `gpt-6-luna`, `gemini-1.5-flash`, `llama-3.1-8b-instant`, `llama3.2:3b` |
+| set | set | `provider/model` |
+| `null` | set | The model as given: a full `provider/model`, or one of OpenClaw's aliases |
+
+Naming a model, `"utility"` included, is an override of OpenClaw's choice, which OpenClaw
+allows a plugin only with the operator's leave. Set it once, beside the plugin's `config`:
+
+```json
+{ "plugins": { "entries": { "notify": { "llm": { "allowModelOverride": true } } } } }
+```
+
+Without it a named model is refused (`Plugin LLM completion cannot override the target model`),
+`notify doctor` says so, and messages go out as the plain template.
+
+On an older OpenClaw without that function the plugin calls the provider itself, with a key
+it asks OpenClaw for: the provider is `llm.provider`, or the first of
+`anthropic → openai → google → groq → ollama` that has a key, and the model is `llm.model` or
+that provider's cheap model from the list above.
 
 ## Prompt injection
 
@@ -256,10 +284,12 @@ Each row has a 10-attempt budget spread over ~3.8 days of exponential backoff (s
 
 **Notifications are suddenly terse / template-looking.** The LLM batch call is
 failing and the tick is falling back to the per-row template. Check the gateway
-log for `notify: LLM <provider>/<model> failing` — the first fallback per
-(provider, model) per hour is logged at error level with the underlying cause.
-Typical fixes: rotate the API key, or pin `llm.model` to a current model id
-(models get deprecated). Run `openclaw notify doctor` for a live probe.
+log for `notify: LLM <provider>/<model> failing` (or `LLM through OpenClaw/<model>
+failing`) — the first fallback per model per hour is logged at error level with the
+underlying cause. Typical fixes: allow the named model
+(`plugins.entries.notify.llm.allowModelOverride: true`), rotate the API key, or pin
+`llm.model` to a current model id (models get deprecated). Run `openclaw notify doctor`
+for a live probe.
 
 **Destination never flushes.** A channel plugin listed in `destinations.<name>.channel`
 isn't registered at service-start time. `notify doctor` will flag it, and the

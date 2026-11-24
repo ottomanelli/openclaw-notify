@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { ChannelName, KnownChannel, LlmConfig, QueueRow, ParsedRawData, RuntimeBridge } from "./types.js";
+import type { ChannelName, HostLlm, KnownChannel, LlmConfig, QueueRow, ParsedRawData, RuntimeBridge } from "./types.js";
 
 // Per-channel markdown hint so the LLM emits syntax the destination actually
 // renders. Telegram/Slack/Signal treat *single asterisks* as bold; Discord
@@ -49,8 +49,14 @@ const BOLD_STYLE_BY_CHANNEL: Record<KnownChannel, (s: string) => string> = {
 // without this, a hung provider freezes the chained-setTimeout tick loop.
 const LLM_FETCH_TIMEOUT_MS = 30_000;
 
+// Claude's newer models (Haiku 5.5, Sonnet 5.5, Opus 5.5, ...) think before they answer
+// unless told otherwise, and that thinking counts against `max_tokens`. A cap sized for
+// the message alone could be spent before a word of it is written, so this leaves room
+// for both. The message itself stays short because the prompt asks for that.
+const ANTHROPIC_MAX_TOKENS = 2000;
+
 export const CHEAP_MODELS = {
-  anthropic: "claude-haiku-4-5",
+  anthropic: "claude-haiku-5-5",
   openai:    "gpt-6-luna",
   google:    "gemini-1.5-flash",
   groq:      "llama-3.1-8b-instant",
@@ -102,6 +108,92 @@ export type ResolvedLlm = {
   apiKey: string;
 };
 
+// What a completion through OpenClaw may spend. Advisory: the host applies it where the
+// model's provider has such a limit. Newer models think before answering and that counts
+// against the limit, so it leaves room for both; the prompt keeps the message short.
+const HOST_MAX_TOKENS = 2000;
+
+/** `llm.model: "utility"`: the small model of whichever provider OpenClaw is set to use. */
+export const UTILITY = "utility";
+
+/**
+ * OpenClaw's small model, as "provider/model": the utility model its settings name
+ * (`agents.defaults.utilityModel`), or else the cheap model this plugin knows for the
+ * provider of the agent's own model. Undefined when neither can be told (a provider this
+ * plugin has no cheap model for, an older OpenClaw): OpenClaw's own model is then used.
+ * OpenClaw does not hand plugins its own choice of utility model, so this works it out.
+ */
+export function utilityModel(runtime: RuntimeBridge | undefined): string | undefined {
+  try {
+    const cfg = runtime?.config?.current?.();
+    const set = (cfg as { agents?: { defaults?: { utilityModel?: unknown } } } | undefined)?.agents?.defaults?.utilityModel;
+    const named = typeof set === "string" ? set : (set as { primary?: unknown } | null | undefined)?.primary;
+    if (typeof named === "string" && named.trim()) return named.trim();
+    const provider = runtime?.modelConfig?.resolveDefaultModelForAgent?.({ cfg })?.provider;
+    const cheap = provider ? CHEAP_MODELS[provider as keyof typeof CHEAP_MODELS] : undefined;
+    return cheap ? `${provider}/${cheap}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The model the settings name, as OpenClaw writes one ("provider/model"), or undefined
+ * when they name none and OpenClaw's own model is to be used.
+ *   "utility", no provider -> the small model of OpenClaw's own provider (see utilityModel)
+ *   provider and model     -> "provider/model"
+ *   provider alone         -> that provider's cheap model
+ *   model alone            -> the model as given (a full "provider/model", or an alias of OpenClaw's)
+ */
+export function namedModel(llm: LlmConfig, runtime?: RuntimeBridge): string | undefined {
+  const given = llm.model?.trim() || undefined;
+  if (given === UTILITY && !llm.provider) return utilityModel(runtime);
+  const model = given === UTILITY ? undefined : given;
+  if (!llm.provider) return model;
+  if (model?.includes("/")) return model;
+  const chosen = model ?? CHEAP_MODELS[llm.provider as keyof typeof CHEAP_MODELS];
+  return chosen ? `${llm.provider}/${chosen}` : undefined;
+}
+
+/** True when OpenClaw offers plugins its own completion, which is then the one way used. */
+export function hasHostLlm(runtime: RuntimeBridge): runtime is RuntimeBridge & { llm: HostLlm } {
+  return typeof runtime.llm?.complete === "function";
+}
+
+/**
+ * Asks a model through OpenClaw (`api.runtime.llm.complete`). The plugin then prepares no
+ * request of its own: OpenClaw picks the model (its agent's, unless `model` names one),
+ * holds the key and shapes the request for the provider. Naming a model needs the
+ * operator's leave: `plugins.entries.notify.llm.allowModelOverride: true`.
+ */
+export async function callHostLlm(
+  host: HostLlm,
+  model: string | undefined,
+  systemPrompt: string,
+  userPrompt: string,
+  purpose: string,
+): Promise<{ text: string; provider: string; model: string }> {
+  let result: Awaited<ReturnType<HostLlm["complete"]>>;
+  try {
+    result = await host.complete({
+      messages: [{ role: "user", content: userPrompt }],
+      systemPrompt,
+      ...(model ? { model } : {}),
+      maxTokens: HOST_MAX_TOKENS,
+      reasoning: "low",
+      purpose,
+      signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const why = (err instanceof Error ? err.message : String(err)).split("\n", 1)[0].slice(0, 300);
+    const refused = model && /override|not allowed|not permitted|authoriz/i.test(why);
+    throw new Error(refused ? `${why} (to let notify name a model, set plugins.entries.notify.llm.allowModelOverride: true)` : why);
+  }
+  const text = typeof result?.text === "string" ? result.text.trim() : "";
+  if (!text) throw new Error("OpenClaw's completion came back empty");
+  return { text, provider: result.provider, model: result.model };
+}
+
 export async function selectProviderAndModel(
   runtime: RuntimeBridge,
   llm: LlmConfig,
@@ -113,7 +205,8 @@ export async function selectProviderAndModel(
   for (const provider of candidates) {
     const auth = await runtime.modelAuth.resolveApiKeyForProvider({ provider });
     if (auth.apiKey && auth.apiKey.length > 0) {
-      const model = llm.model ?? CHEAP_MODELS[provider as keyof typeof CHEAP_MODELS];
+      // "utility" is no model's name: here it means this provider's cheap one.
+      const model = (llm.model === UTILITY ? null : llm.model) ?? CHEAP_MODELS[provider as keyof typeof CHEAP_MODELS];
       if (!model) continue;
       return { provider, model, apiKey: auth.apiKey };
     }
@@ -252,11 +345,13 @@ export async function callLlm(
       "anthropic-version": "2023-06-01",
       "content-type": "application/json",
     };
+    // No `temperature`: Claude's newer models answer HTTP 400 to any value but their
+    // default ("`temperature` is deprecated for this model"), and the older ones do
+    // not need it. One request shape for every Claude model.
     body = {
       model: resolved.model,
       system: systemPrompt,
-      max_tokens: 500,
-      temperature: 0.7,
+      max_tokens: ANTHROPIC_MAX_TOKENS,
       messages: [{ role: "user", content: userPrompt }],
     };
   } else if (api === "google") {
@@ -312,8 +407,17 @@ export async function callLlm(
   const json = (await resp.json()) as Record<string, unknown>;
 
   if (api === "anthropic") {
-    const content = (json.content as Array<{ text?: string }> | undefined)?.[0]?.text;
-    if (!content) throw new Error("Anthropic response missing content");
+    // Read the answer by kind of block, not by position: a reply from a model that
+    // thought first begins with `thinking` blocks, and the text comes after them.
+    const blocks = (json.content as Array<{ type?: string; text?: string }> | undefined) ?? [];
+    const content = blocks
+      .filter((block) => (block.type ?? "text") === "text" && typeof block.text === "string")
+      .map((block) => block.text)
+      .join("");
+    if (!content) {
+      // `max_tokens`: the thinking used the whole cap. `refusal`: the model declined.
+      throw new Error(`Anthropic response missing content (stop_reason: ${String(json.stop_reason ?? "unknown")})`);
+    }
     return content;
   }
   if (api === "google") {
@@ -343,6 +447,22 @@ export async function formatBatch(
 ): Promise<string> {
   const { fetchFn = fetch, channel = null, logger = null } = options;
   if (rows.length === 0) return "";
+  if (!llm.enabled) return renderTemplate(rows, channel);
+
+  // Through OpenClaw when it offers that. The plugin's own request to a provider, below,
+  // is only for an older OpenClaw.
+  if (hasHostLlm(runtime)) {
+    const named = namedModel(llm, runtime);
+    logger?.debug?.(`notify: formatting through OpenClaw with ${named ?? "its own model"}`);
+    const prompt = buildLlmPrompt(rows, personality, undefined, channel);
+    try {
+      return (await callHostLlm(runtime.llm, named, prompt.systemPrompt, prompt.userPrompt, "notify.format")).text;
+    } catch (err) {
+      logLlmFallback(logger, "through OpenClaw", named ?? "its own model", err instanceof Error ? err.message : String(err));
+      return renderTemplate(rows, channel);
+    }
+  }
+
   const resolved = await selectProviderAndModel(runtime, llm);
   if (!resolved) return renderTemplate(rows, channel);
 

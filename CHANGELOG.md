@@ -32,6 +32,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Gateway's own tick).
 
 ### Fixed
+- **Claude's newer models work for LLM formatting.** With `llm.provider: "anthropic"` and a model such as
+  `claude-haiku-5-5`, every formatting call failed with HTTP 400 (`temperature is deprecated for this
+  model`) and messages went out as the plain template. The Anthropic request no longer sends `temperature`
+  (older Claude models do not need it), allows 2000 tokens instead of 500 because these models think
+  before answering and that thinking counts against the cap, and reads the answer from the reply's text
+  blocks instead of its first block, which is a thinking block when the model thought first. An empty
+  answer now names the reason (`stop_reason`).
 
 - `notify doctor` no longer reports a destination made of webhooks only as "channel NOT registered":
   it has no chat, so there is no channel to look for.
@@ -47,7 +54,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   provider now sends `max_completion_tokens` and no temperature. Other
   OpenAI-compatible providers are unchanged.
 
+### Added
+- **`llm.model: "utility"`**: the small model of whichever provider OpenClaw is set to use, so
+  formatting stays cheap and follows a change of provider with no change here. It is the
+  utility model OpenClaw's settings name, or else this plugin's cheap model for the provider
+  of the agent's own model. Like any named model it needs
+  `plugins.entries.notify.llm.allowModelOverride: true`.
+
 ### Changed
+- The cheap model for Anthropic is `claude-haiku-5-5` (was `claude-haiku-4-5`).
+- **LLM formatting goes through OpenClaw.** Where OpenClaw offers plugins its own completion
+  (`api.runtime.llm.complete`), the plugin uses it for every batch and for `notify doctor`'s
+  probe, instead of asking OpenClaw for a key and calling the provider itself. OpenClaw picks
+  the model, holds the key and shapes the request, so a provider's newer models no longer
+  need a change here. **With `llm.provider` and `llm.model` both `null` the model is now
+  OpenClaw's own for the agent**, not the cheap model of the first provider with a key.
+  **A named model now needs `plugins.entries.notify.llm.allowModelOverride: true`**; without
+  it OpenClaw refuses the override, `doctor` reports it and messages use the template. On an
+  older OpenClaw the plugin calls the provider itself as before. See "Which model formats"
+  in the README.
 
 - The cheap default model for OpenAI is `gpt-6-luna` (was `gpt-4o-mini`).
 - `better-sqlite3` ^12, which has builds for Node 24 to 26. With ^11 on Node 24 the

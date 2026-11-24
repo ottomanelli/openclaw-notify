@@ -3,7 +3,7 @@ import type { NotifyConfig, RuntimeBridge } from "./types.js";
 import { openDb, closeDb } from "./db.js";
 import { enqueue, purge, retryFailed } from "./queue.js";
 import type { TickResult } from "./tick.js";
-import { callLlm, selectProviderAndModel } from "./format.js";
+import { callHostLlm, callLlm, hasHostLlm, namedModel, selectProviderAndModel } from "./format.js";
 import { destinationUsableHere } from "./validate.js";
 import type { DoctorReport, FlushRequest, GatewayAnswer } from "./gateway.js";
 
@@ -328,6 +328,20 @@ export async function runDoctor(params: {
     lines.push("- llm: disabled (template fallback only)");
   } else if (skipLlm) {
     lines.push("- llm: probe skipped (--skip-llm)");
+  } else if (hasHostLlm(runtime)) {
+    // The same way a batch is formatted: through OpenClaw, which picks the model and
+    // holds the key. A tiny prompt, so the real path is tried for next to nothing.
+    const named = namedModel(config.llm, runtime);
+    try {
+      const started = Date.now();
+      const out = await callHostLlm(runtime.llm, named, "Respond with a single word.", "ping", "notify.doctor");
+      const ms = Date.now() - started;
+      const snippet = out.text.replace(/\s+/g, " ").slice(0, 40);
+      lines.push(`✓ llm: ${out.provider}/${out.model} through OpenClaw${named ? "" : " (its own model)"} — responded in ${ms}ms ("${snippet}")`);
+    } catch (err) {
+      lines.push(`✗ llm: ${named ?? "OpenClaw's own model"} through OpenClaw — ${err instanceof Error ? err.message : String(err)}`);
+      ok = false;
+    }
   } else {
     // Looking up a key can throw outright in a plain CLI process, which has no access
     // to the Gateway's credential store.

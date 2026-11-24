@@ -750,7 +750,31 @@ describe("cli doctor", () => {
     })) as unknown as typeof fetch;
     const report = await runDoctor(doctorDeps({ cfg, runtime, fetchFn }));
     expect(report.ok).toBe(true);
-    expect(report.lines.join("\n")).toMatch(/llm: anthropic\/claude-haiku-4-5 — responded in \d+ms \("pong"\)/);
+    expect(report.lines.join("\n")).toMatch(/llm: anthropic\/claude-haiku-5-5 — responded in \d+ms \("pong"\)/);
+  });
+
+  it("probes through OpenClaw when it offers its own completion, and reports the model that answered", async () => {
+    const runtime = defaultRuntime();
+    const complete = vi.fn(async (_params: Record<string, unknown>) => ({ text: "pong", provider: "anthropic", model: "claude-sonnet-5-5" }));
+    (runtime as Record<string, unknown>).llm = { complete };
+    runtime.modelAuth = { resolveApiKeyForProvider: vi.fn(async () => { throw new Error("no key lookup is expected"); }) } as never;
+    const fetchFn = vi.fn(async () => { throw new Error("no request of the plugin's own is expected"); }) as unknown as typeof fetch;
+
+    let report = await runDoctor(doctorDeps({ cfg: baseConfig({ llm: { enabled: true, provider: null, model: null } }), runtime, fetchFn }));
+    expect(report.ok).toBe(true);
+    expect(report.lines.join("\n")).toMatch(/✓ llm: anthropic\/claude-sonnet-5-5 through OpenClaw \(its own model\) — responded in \d+ms \("pong"\)/);
+    expect(complete.mock.calls[0][0]).toMatchObject({ purpose: "notify.doctor" });
+    expect(complete.mock.calls[0][0]).not.toHaveProperty("model");
+
+    complete.mockImplementationOnce(async () => ({ text: "pong", provider: "anthropic", model: "claude-haiku-5-5" }));
+    report = await runDoctor(doctorDeps({ cfg: baseConfig({ llm: { enabled: true, provider: "anthropic", model: "claude-haiku-5-5" } }), runtime, fetchFn }));
+    expect(report.lines.join("\n")).toMatch(/✓ llm: anthropic\/claude-haiku-5-5 through OpenClaw — responded/);
+    expect(complete.mock.calls[1][0]).toMatchObject({ model: "anthropic/claude-haiku-5-5" });
+
+    complete.mockImplementationOnce(async () => { throw new Error("model override is not allowed for plugin notify"); });
+    report = await runDoctor(doctorDeps({ cfg: baseConfig({ llm: { enabled: true, provider: "anthropic", model: "claude-haiku-5-5" } }), runtime, fetchFn }));
+    expect(report.ok).toBe(false);
+    expect(report.lines.join("\n")).toMatch(/✗ llm: anthropic\/claude-haiku-5-5 through OpenClaw — model override is not allowed.*allowModelOverride: true/);
   });
 
   it("reports LLM failure with the underlying error message", async () => {
@@ -767,7 +791,7 @@ describe("cli doctor", () => {
     })) as unknown as typeof fetch;
     const report = await runDoctor(doctorDeps({ cfg, runtime, fetchFn }));
     expect(report.ok).toBe(false);
-    expect(report.lines.join("\n")).toMatch(/llm: anthropic\/claude-haiku-4-5 — LLM HTTP 404: model not found/);
+    expect(report.lines.join("\n")).toMatch(/llm: anthropic\/claude-haiku-5-5 — LLM HTTP 404: model not found/);
   });
 
   it("reports queue depth and flags failed rows so the operator inspects them", async () => {
